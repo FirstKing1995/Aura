@@ -15,7 +15,7 @@
 
     API: Object.freeze({
       // Cole aqui a URL /exec da implantação do Apps Script.
-      BASE_URL: 'https://script.google.com/macros/s/COLE_SEU_DEPLOYMENT_ID_AQUI/exec',
+      BASE_URL: 'https://script.google.com/macros/s/AKfycbyWuksk8OCgkKdTBGGBlN6Qiy_tyD647Icl_8Ogc0fNQEUCRJiZsYltvHPLotHprwXHkQ/exec',
       TIMEOUT_MS: 15000,
       RETRIES: 2,
       RETRY_BACKOFF_MS: 700,
