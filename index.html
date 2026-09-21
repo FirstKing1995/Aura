@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
   <meta name="theme-color" content="#05060d">
-  <meta name="description" content="Aura — jogo de tabuleiro 9x9 de território e cerco.">
+  <meta name="description" content="Aura — jogo de tabuleiro de território, cerco e luz. Seis arenas, cinco peças, trilha sonora procedural.">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="mobile-web-app-capable" content="yes">
   <title>Aura</title>
@@ -29,6 +29,13 @@
   <header class="chrome">
     <span class="chrome__mark">aura</span>
     <span id="conn-badge" class="conn" role="status"></span>
+
+    <button id="audio-toggle" class="audio-toggle" type="button" data-on="true" aria-label="Som">
+      <span class="audio-toggle__wave"></span>
+      <span class="audio-toggle__wave"></span>
+      <span class="audio-toggle__wave"></span>
+    </button>
+
     <label class="lang">
       <span class="sr-only" data-i18n="common.language">Idioma</span>
       <select id="lang-select" class="lang__select" aria-label="Idioma"></select>
@@ -102,6 +109,11 @@
         <span class="tile__glow"></span>
       </button>
 
+      <button class="tile tile--campaign" type="button" data-action="home.campaign">
+        <span class="tile__title" data-i18n="home.campaign"></span>
+        <span id="campaign-badge" class="tile__badge"></span>
+      </button>
+
       <button class="tile" type="button" data-action="home.playBot">
         <span class="tile__title" data-i18n="home.playBot"></span>
       </button>
@@ -114,6 +126,10 @@
           <span class="tile__title" data-i18n="home.tutorial"></span>
         </button>
       </div>
+
+      <button class="tile tile--quiet" type="button" data-action="home.codex">
+        <span class="tile__title" data-i18n="home.codex"></span>
+      </button>
     </div>
 
     <div class="levels glass">
@@ -128,8 +144,47 @@
       </div>
     </div>
 
+    <div class="mixer glass">
+      <p class="levels__label" data-i18n="audio.title"></p>
+      <label class="slider">
+        <span class="slider__label" data-i18n="audio.music"></span>
+        <input id="music-range" class="slider__input" type="range" min="0" max="100" value="34">
+      </label>
+      <label class="slider">
+        <span class="slider__label" data-i18n="audio.sfx"></span>
+        <input id="sfx-range" class="slider__input" type="range" min="0" max="100" value="62">
+      </label>
+    </div>
+
     <button class="btn btn--quiet btn--small" type="button" data-action="home.logout"
             data-i18n="home.logout"></button>
+  </section>
+
+  <!-- ===================== campanha ===================== -->
+  <section id="screen-campaign" class="screen" aria-hidden="true">
+    <div class="pane glass pane--wide">
+      <h2 class="pane__title" data-i18n="campaign.title"></h2>
+      <p class="pane__sub" data-i18n="campaign.subtitle"></p>
+      <p id="campaign-progress" class="pane__meta"></p>
+
+      <div id="campaign-list" class="phases"></div>
+
+      <button class="btn btn--ghost" type="button" data-action="nav.home"
+              data-i18n="common.back"></button>
+    </div>
+  </section>
+
+  <!-- ===================== códex ===================== -->
+  <section id="screen-codex" class="screen" aria-hidden="true">
+    <div class="pane glass pane--wide">
+      <h2 class="pane__title" data-i18n="codex.title"></h2>
+      <p class="pane__sub" data-i18n="codex.subtitle"></p>
+
+      <ul id="codex-list" class="codex"></ul>
+
+      <button class="btn btn--ghost" type="button" data-action="nav.home"
+              data-i18n="common.back"></button>
+    </div>
   </section>
 
   <!-- ===================== fila ===================== -->
@@ -150,10 +205,16 @@
   <!-- ===================== partida ===================== -->
   <section id="screen-game" class="screen screen--game" aria-hidden="true">
 
+    <div class="arena-strip">
+      <span id="arena-name" class="arena-strip__name"></span>
+      <span id="ply-count" class="arena-strip__ply"></span>
+    </div>
+
     <div id="player-top" class="player player--top glass" data-side="b">
       <span class="player__dot"></span>
       <span id="top-name" class="player__name"></span>
       <span id="top-meta" class="player__meta"></span>
+      <span id="roster-top" class="roster"></span>
     </div>
 
     <div class="territory">
@@ -161,7 +222,7 @@
       <div class="territory__track">
         <span id="bar-a" class="territory__fill territory__fill--a"></span>
         <span id="bar-b" class="territory__fill territory__fill--b"></span>
-        <span class="territory__goal" style="left:70%"></span>
+        <span id="bar-goal" class="territory__goal" style="left:70%"></span>
       </div>
       <span id="bar-label-b" class="territory__label territory__label--b">0%</span>
     </div>
@@ -177,6 +238,7 @@
       <span class="player__dot"></span>
       <span id="bottom-name" class="player__name"></span>
       <span id="bottom-meta" class="player__meta"></span>
+      <span id="roster-bottom" class="roster"></span>
     </div>
 
     <div class="game-actions">
@@ -203,7 +265,11 @@
 
 <div id="overlay-tutorial" class="overlay overlay--tutorial" aria-live="polite">
   <div class="tut glass">
-    <div id="tut-dots" class="tut__dots"></div>
+    <div class="tut__head">
+      <div id="tut-dots" class="tut__dots"></div>
+      <span id="tut-counter" class="tut__counter"></span>
+    </div>
+    <h3 id="tut-title" class="tut__title"></h3>
     <p id="tut-caption" class="tut__caption"></p>
     <button class="btn btn--quiet btn--small" type="button" data-action="tutorial.skip"
             data-i18n="tutorial.skip"></button>
@@ -225,11 +291,14 @@
     <div class="result__halo" aria-hidden="true"></div>
     <h2 id="result-title" class="result__title"></h2>
     <p id="result-reason" class="result__reason"></p>
+    <div id="result-stars" class="stars" data-stars="0" hidden></div>
     <p class="result__elo-row">
       <span id="result-elo" class="result__elo"></span>
       <span id="result-delta" class="result__delta" data-sign="up"></span>
     </p>
     <div class="result__actions">
+      <button id="result-next" class="btn btn--primary" type="button" data-action="result.next"
+              data-i18n="result.next" hidden></button>
       <button class="btn btn--primary" type="button" data-action="result.rematch"
               data-i18n="result.rematch"></button>
       <button class="btn btn--ghost" type="button" data-action="result.home"
@@ -243,10 +312,12 @@
 <!-- ===================== scripts ===================== -->
 <script src="js/config.js"></script>
 <script src="js/utils.js"></script>
+<script src="js/arenas.js"></script>
 <script src="js/rules.js"></script>
 <script src="js/ai.js"></script>
 <script src="js/bot.js"></script>
 <script src="js/i18n.js"></script>
+<script src="js/audio.js"></script>
 <script src="js/api.js"></script>
 <script src="js/net.js"></script>
 <script src="js/ui.js"></script>
