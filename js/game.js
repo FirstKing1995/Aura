@@ -2,15 +2,16 @@
  * ============================================================================
  *  AURA — GameController
  * ============================================================================
- *  Orquestra tudo: autenticação, menu, fila, partida (online ou IA), resultado
- *  e ranking. A UI só emite intenções; as regras vivem em rules.js; a rede em
- *  api.js/net.js. Este arquivo é a cola — e a única peça que conhece o fluxo.
+ *  Orquestra tudo: autenticação, menu, campanha, fila, partida (online, rápida
+ *  ou de fase), áudio adaptativo, resultado e ranking. A UI só emite
+ *  intenções; as regras vivem em rules.js; a rede em api.js/net.js.
  *
  *  Padrões:
- *    - State Machine        (screens + estados de partida)
- *    - Strategy             (MatchSession: Online vs. Bot)
+ *    - State Machine        (telas + estados de partida)
+ *    - Strategy             (MatchSession: Online | Bot | Campanha)
  *    - Observer/EventBus    (desacopla UI de lógica)
  *    - Command              (intenções `ui:action` roteadas por tabela)
+ *    - Repository           (CampaignProgress sobre o Storage local)
  * ============================================================================
  */
 (function (root) {
@@ -21,8 +22,62 @@
   const I = root.AuraI18n;
   const API = root.AuraApi;
   const BOT = root.AuraBot;
+  const AUDIO = root.AuraAudio;
+  const ARENAS = root.AuraArenas;
   const { Poller } = root.AuraNet;
-  const { Storage, sleep, formatDuration } = root.AuraUtils;
+  const { Storage, sleep, clamp } = root.AuraUtils;
+
+  /* ================================================================== */
+  /* Progresso da campanha (repositório local)                          */
+  /* ================================================================== */
+
+  const CampaignProgress = {
+    load() {
+      const raw = Storage.get('campaign', null);
+      const base = { cleared: {}, unlockedUpTo: CFG.CAMPAIGN.UNLOCKED_AT_START };
+      if (!raw || typeof raw !== 'object') return base;
+      return {
+        cleared: raw.cleared || {},
+        unlockedUpTo: Math.max(CFG.CAMPAIGN.UNLOCKED_AT_START, raw.unlockedUpTo || 1)
+      };
+    },
+    save(progress) { Storage.set('campaign', progress); },
+
+    /** Registra o resultado de uma fase; devolve a arena recém-liberada. */
+    record(order, arenaId, stars) {
+      const p = this.load();
+      const previous = p.cleared[arenaId] || 0;
+      if (stars > previous) p.cleared[arenaId] = stars;
+
+      let unlocked = null;
+      if (stars > 0 && order >= p.unlockedUpTo) {
+        const nextDef = ARENAS.phaseAt(order + 1);
+        if (nextDef) { p.unlockedUpTo = order + 1; unlocked = nextDef; }
+      }
+      this.save(p);
+      return { progress: p, unlocked: unlocked };
+    }
+  };
+
+  /**
+   * Estrelas de uma fase:
+   *   1 — vencer
+   *   2 — vencer sem perder mais de 1/3 do exército
+   *   3 — vencer dentro do orçamento de lances da arena
+   */
+  function computeStars(state, mySide, arena) {
+    if (state.winner !== mySide) return 0;
+    let stars = 1;
+
+    const survivors = R.countPieces(state, mySide).total;
+    const started = arena.pieces.length / 2;
+    if (survivors >= Math.ceil(started * 0.67)) stars++;
+
+    const budget = CFG.CAMPAIGN.STAR_PLY_BUDGET[arena.N] || 100;
+    if (state.ply <= budget) stars++;
+
+    return Math.min(3, stars);
+  }
 
   /* ================================================================== */
   /* Sessões de partida (Strategy)                                      */
@@ -30,7 +85,7 @@
 
   class MatchSession {
     constructor(ctx) {
-      this.ctx = ctx;              // GameController
+      this.ctx = ctx;
       this.bus = ctx.bus;
       this.state = null;
       this.mySide = R.A;
@@ -38,6 +93,7 @@
       this.opponentElo = 0;
       this.busy = false;
       this.finished = false;
+      this.phase = null;                 // preenchido só na campanha
     }
     get myPlayer() { return this.mySide; }
     get isMyTurn() { return this.state && this.state.turn === this.mySide && !this.busy; }
@@ -50,10 +106,15 @@
   /* ------------------------- Partida contra a IA -------------------- */
 
   class BotMatchSession extends MatchSession {
-    constructor(ctx, { level, playerSide } = {}) {
+    constructor(ctx, options) {
       super(ctx);
-      this.level = level || BOT.level;
-      this.mySide = playerSide || (Math.random() < 0.5 ? R.A : R.B);
+      const o = options || {};
+      this.level = o.level || BOT.level;
+      this.arenaId = o.arenaId || CFG.BOARD.DEFAULT_ARENA;
+      this.phase = o.phase || null;
+      // Na campanha o jogador é sempre A (embaixo): o aprendizado precisa de
+      // um ponto de vista estável. No jogo rápido, o lado é sorteado.
+      this.mySide = o.playerSide || (this.phase ? R.A : (Math.random() < 0.5 ? R.A : R.B));
       this.botSide = R.opponent(this.mySide);
       this.opponentName = BOT.generateName(Date.now());
       this.opponentElo = BOT.estimatedElo();
@@ -63,7 +124,7 @@
     async start() {
       BOT.setLevel(this.level);
       BOT.init();
-      this.state = R.createInitialState();
+      this.state = R.createInitialState(this.arenaId);
       this.bus.emit('match:ready', this);
       this.bus.emit('match:state', { state: this.state, animate: false });
       if (this.state.turn === this.botSide) this._botTurn();
@@ -121,7 +182,9 @@
         reason: state.reason,
         mySide: this.mySide,
         ranked: false,
-        ranking: null
+        ranking: null,
+        phase: this.phase,
+        state: state
       });
     }
 
@@ -139,7 +202,6 @@
       this.version = 0;
       this.poller = null;
       this.players = null;
-      this.pendingSync = false;
     }
 
     async start() {
@@ -239,7 +301,8 @@
         mySide: this.mySide,
         ranked: true,
         ranking: ranking || null,
-        sideLetter: this.sideLetter
+        sideLetter: this.sideLetter,
+        state: state
       });
     }
 
@@ -265,6 +328,7 @@
       this.queue = null;
       this.tutorial = new root.AuraTutorial(ui, bus);
       this.guest = false;
+      this.lastResult = null;
       this._wire();
     }
 
@@ -306,7 +370,11 @@
       this.ui.renderProfile(this.user || {
         username: I.t('common.you'), elo: '—', division: 'iron', wins: 0, losses: 0
       });
+      this.ui.renderCampaign(CampaignProgress.load());
       this.ui.showScreen('home');
+      AUDIO.setMood('menu');
+      AUDIO.setIntensity(0.15);
+      AUDIO.startMusic('menu');
     }
 
     /* --------------------------- roteamento -------------------------- */
@@ -322,17 +390,27 @@
         'auth.offline':     () => this.playAsGuest(),
         'home.playOnline':  () => this.startQueue(),
         'home.playBot':     () => this.startBotMatch(),
+        'home.campaign':    () => this.openCampaign(),
+        'home.codex':       () => this.ui.showScreen('codex'),
         'home.ranking':     () => this.openRanking(),
         'home.tutorial':    () => this.tutorial.start(() => this.goHome()),
         'home.logout':      () => this.logout(),
         'home.setLevel':    ({ value }) => this.setLevel(value),
+        'campaign.play':    ({ value }) => this.startPhase(Number(value)),
+        'campaign.locked':  () => this.ui.toast(I.t('campaign.lockedHint'), 'warn'),
         'queue.cancel':     () => this.cancelQueue(),
         'game.resign':      () => this.confirmResign(),
         'game.back':        () => this.leaveMatch(),
         'result.rematch':   () => this.rematch(),
+        'result.next':      () => this.playNextPhase(),
         'result.home':      () => { this.ui.hideResult(); this.leaveMatch(); },
         'nav.home':         () => { this.ui.hideResult(); this.goHome(); },
-        'tutorial.skip':    () => { this.tutorial.stop(); Storage.set('tutorialDone', true); this.goHome(); }
+        'nav.campaign':     () => { this.ui.hideResult(); this.openCampaign(); },
+        'tutorial.skip':    () => {
+          this.tutorial.stop();
+          Storage.set('tutorialDone', true);
+          this.goHome();
+        }
       };
 
       this.bus.on('ui:action', payload => {
@@ -346,9 +424,13 @@
       this.bus.on('match:thinking', flag => this.onThinking(flag));
       this.bus.on('match:end', payload => this.onMatchEnd(payload));
       this.bus.on('connection:change', online => this.ui.setConnection(online));
+      this.bus.on('ui:audioUnlocked', () => {
+        AUDIO.startMusic(this.session ? 'battle' : 'menu');
+      });
       this.bus.on('ui:languageChanged', () => {
         this.ui.setAuthMode(this.authMode);
         if (this.user) this.ui.renderProfile(this.user);
+        this.ui.renderCampaign(CampaignProgress.load());
         if (this.session && this.session.state) this.refreshHud();
       });
     }
@@ -404,6 +486,43 @@
       Storage.set('aiLevel', level);
       BOT.setLevel(level);
       this.ui.setLevel(level);
+    }
+
+    /* --------------------------- campanha --------------------------- */
+
+    openCampaign() {
+      this.ui.renderCampaign(CampaignProgress.load());
+      this.ui.showScreen('campaign');
+    }
+
+    async startPhase(order) {
+      const def = ARENAS.phaseAt(order);
+      if (!def) return;
+      const progress = CampaignProgress.load();
+      if (order > progress.unlockedUpTo) {
+        this.ui.toast(I.t('campaign.lockedHint'), 'warn');
+        return;
+      }
+
+      this.disposeSession();
+      this.session = new BotMatchSession(this, {
+        level: def.level,
+        arenaId: def.id,
+        phase: { order: def.order, id: def.id }
+      });
+      this.ui.showScreen('game');
+      AUDIO.play('phase');
+      await this.session.start();
+      this.ui.board.intro();
+    }
+
+    playNextPhase() {
+      this.ui.hideResult();
+      const phase = this.lastResult && this.lastResult.phase;
+      if (!phase) return this.goHome();
+      const next = ARENAS.phaseAt(phase.order + 1);
+      if (!next) { this.goHome(); return; }
+      this.startPhase(next.order);
     }
 
     /* ----------------------------- fila ----------------------------- */
@@ -481,9 +600,13 @@
 
     async startBotMatch() {
       this.disposeSession();
-      this.session = new BotMatchSession(this, { level: this.level });
+      this.session = new BotMatchSession(this, {
+        level: this.level,
+        arenaId: CFG.BOARD.DEFAULT_ARENA
+      });
       this.ui.showScreen('game');
       await this.session.start();
+      this.ui.board.intro();
     }
 
     async enterOnlineMatch(matchId, side) {
@@ -493,6 +616,7 @@
       this.ui.showScreen('game');
       try {
         await this.session.start();
+        this.ui.board.intro();
       } catch (err) {
         this.handleNetworkError(err);
         this.goHome();
@@ -504,20 +628,27 @@
       this.ui.board.setPerspective(session.mySide);
       this.ui.board.clearSelection();
       this.ui.hideResult();
+
+      const me = this.user
+        ? { name: this.user.username, elo: this.user.elo }
+        : { name: I.t('common.you'), elo: 1000 };
+      const foe = { name: session.opponentName, elo: session.opponentElo };
+
       this.ui.renderMatchHeader({
         you: session.mySide === R.A ? 'A' : 'B',
-        players: session.players || {
-          A: session.mySide === R.A
-            ? { name: this.user ? this.user.username : I.t('common.you'), elo: this.user ? this.user.elo : 1000 }
-            : { name: session.opponentName, elo: session.opponentElo },
-          B: session.mySide === R.B
-            ? { name: this.user ? this.user.username : I.t('common.you'), elo: this.user ? this.user.elo : 1000 }
-            : { name: session.opponentName, elo: session.opponentElo }
-        },
-        botName: session.opponentName
+        players: session.players || (session.mySide === R.A ? { A: me, B: foe } : { A: foe, B: me }),
+        botName: session.opponentName,
+        arena: session.state ? session.state.arena : null
       });
+
+      AUDIO.setMood('battle');
+      AUDIO.startMusic('battle');
     }
 
+    /**
+     * Sequência de uma jogada na tela, na MESMA ordem do motor:
+     * deslocamento → irradiação → pulso de cerco → estilhaçar.
+     */
     async onMatchState({ state, animate, prev, move }) {
       const board = this.ui.board;
       this.selected = null;
@@ -527,9 +658,13 @@
         board.setLocked(true);
         await board.animateMove(prev, move);
 
+        const radiated = move.radiated || [];
+        if (radiated.length) await board.radiate(move.to, radiated, move.by || state.turn);
+
         const siege = move.siegeCaptures || [];
         const jumps = move.jumpCaptures || move.captures || [];
         if (siege.length) await board.siegePulse(siege, move.by || state.turn);
+
         const removed = jumps.concat(siege);
         if (removed.length) await board.shatter(removed, move.by || R.A);
       }
@@ -538,6 +673,7 @@
       board.markLastMove(state.lastMove);
       board.setLocked(state.status !== 'playing' || !this.session || !this.session.isMyTurn);
       this.refreshHud();
+      this._updateTension(state);
     }
 
     onThinking(flag) {
@@ -553,6 +689,37 @@
         opponentName: this.session.opponentName || I.t('common.bot'),
         thinking: !!this.thinking
       });
+    }
+
+    /**
+     * Converte a situação do tabuleiro em intensidade musical (0..1) e avisa
+     * quando o Núcleo do jogador está com uma respiração só.
+     */
+    _updateTension(state) {
+      if (!this.session) return;
+      const mySide = this.session.mySide;
+      const arena = state.arena;
+
+      const t = R.territoryCount(state);
+      const lead = Math.max(t[R.A], t[R.B]) / arena.territoryThreshold;
+      const progress = clamp(state.ply / arena.maxPlies, 0, 1);
+
+      const myCore = R.coreIndex(state, mySide);
+      let coreDanger = false;
+      if (myCore >= 0) {
+        const lib = root.AuraAI.groupLiberties(state, myCore, R.opponent(mySide));
+        coreDanger = lib <= 1;
+        this.ui.board.markCoreDanger(myCore, lib <= 1);
+        if (coreDanger && !this._warnedCore) {
+          this._warnedCore = true;
+          AUDIO.play('coreWarn');
+          this.ui.toast(I.t('game.coreWarning'), 'warn');
+        } else if (!coreDanger) {
+          this._warnedCore = false;
+        }
+      }
+
+      AUDIO.setIntensity(clamp(lead * 0.6 + progress * 0.25 + (coreDanger ? 0.35 : 0), 0, 1));
     }
 
     /* --------------------- interação com o tabuleiro ----------------- */
@@ -581,6 +748,7 @@
       if (index === this.selected) {
         this.selected = null;
         board.clearSelection();
+        root.AuraAudio.play('deselect');
         return;
       }
 
@@ -606,10 +774,11 @@
       await this.session.resign();
     }
 
-    onMatchEnd({ winner, reason, mySide, ranked, ranking, sideLetter }) {
+    onMatchEnd({ winner, reason, mySide, ranked, ranking, sideLetter, phase, state }) {
       this.ui.board.setLocked(true);
+      this.ui.board.markCoreDanger(-1, false);
       const outcome = winner === 0 || winner === null ? 'draw'
-                    : (winner === mySide ? 'win' : 'loss');
+        : (winner === mySide ? 'win' : 'loss');
 
       let elo = null, delta = null;
       if (ranked && ranking && sideLetter && ranking[sideLetter]) {
@@ -628,25 +797,55 @@
         API.reportBotResult(outcome === 'win').catch(() => {});
       }
 
-      setTimeout(() => this.ui.showResult({ outcome, reason, elo, delta }), 520);
+      // --- campanha: estrelas, desbloqueio e botão "próxima fase" -----
+      let stars = null, hasNext = false;
+      if (phase && state) {
+        const arena = state.arena;
+        stars = computeStars(state, mySide, arena);
+        const result = CampaignProgress.record(phase.order, phase.id, stars);
+        this.ui.renderCampaign(result.progress);
+
+        const nextDef = ARENAS.phaseAt(phase.order + 1);
+        hasNext = !!nextDef && result.progress.unlockedUpTo >= phase.order + 1;
+
+        if (result.unlocked) {
+          setTimeout(() => {
+            AUDIO.play('unlock');
+            this.ui.toast(I.t('campaign.unlocked', { name: I.t('arena.' + result.unlocked.id) }), 'good');
+          }, 1400);
+        } else if (stars > 0 && !nextDef) {
+          setTimeout(() => this.ui.toast(I.t('campaign.allClear'), 'good'), 1400);
+        }
+      }
+
+      this.lastResult = { outcome, phase: phase || null };
+      AUDIO.setIntensity(0.2);
+      AUDIO.setMood(outcome === 'win' ? 'victory' : outcome === 'loss' ? 'defeat' : 'menu');
+
+      setTimeout(() => this.ui.showResult({ outcome, reason, elo, delta, stars, hasNext }), 560);
     }
 
     rematch() {
       this.ui.hideResult();
       const wasOnline = this.session instanceof OnlineMatchSession;
+      const phase = this.session && this.session.phase;
       this.disposeSession();
-      if (wasOnline) this.startQueue(); else this.startBotMatch();
+      if (phase) this.startPhase(phase.order);
+      else if (wasOnline) this.startQueue();
+      else this.startBotMatch();
     }
 
     leaveMatch() {
+      const wasPhase = !!(this.session && this.session.phase);
       this.disposeSession();
-      this.goHome();
+      if (wasPhase) this.openCampaign(); else this.goHome();
     }
 
     disposeSession() {
       if (this.session) { this.session.dispose(); this.session = null; }
       this.thinking = false;
       this.selected = null;
+      this._warnedCore = false;
     }
 
     /* --------------------------- ranking ---------------------------- */
@@ -680,5 +879,8 @@
     }
   }
 
-  root.AuraGame = { GameController, MatchSession, BotMatchSession, OnlineMatchSession };
+  root.AuraGame = {
+    GameController, MatchSession, BotMatchSession, OnlineMatchSession,
+    CampaignProgress, computeStars
+  };
 })(typeof self !== 'undefined' ? self : this);

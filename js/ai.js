@@ -5,14 +5,15 @@
  *  Engine de busca adversarial:
  *    - Negamax com poda Alpha-Beta
  *    - Aprofundamento iterativo com controle de tempo (deadline)
- *    - Tabela de transposição com hashing Zobrist (flags EXACT/LOWER/UPPER)
- *    - Ordenação de movimentos: TT-move > capturas > killer moves > history
- *    - Busca de quiescência sobre saltos (evita o efeito horizonte)
- *    - Função de avaliação multi-fator (material, território, mobilidade,
- *      segurança do Núcleo, pressão de cerco, centralidade)
+ *    - Tabela de transposição com hashing Zobrist (EXACT/LOWER/UPPER)
+ *    - Ordenação: TT-move > capturas > killer moves > history > centralidade
+ *    - Quiescência sobre saltos (mata o efeito horizonte)
+ *    - Avaliação multi-fator, agora ciente de 5 tipos de peça, casas
+ *      bloqueadas, portais e do poder de pintura de cada peça
  *
- *  O arquivo é carregado tanto na thread principal quanto no Web Worker,
- *  portanto não depende de DOM.
+ *  Roda tanto na thread principal quanto dentro do Web Worker: zero DOM.
+ *  Como as arenas têm tamanhos diferentes, todas as tabelas dependentes de
+ *  tamanho são criadas sob demanda e cacheadas por N.
  * ============================================================================
  */
 (function (root) {
@@ -25,67 +26,97 @@
   const MATE = 1e7;
   const TIMEOUT = { __timeout: true };
 
-  /* ------------------------------------------------------------------ */
-  /* Zobrist hashing                                                     */
-  /* ------------------------------------------------------------------ */
-  const Zobrist = (() => {
-    // PRNG determinístico (xorshift32) para que o hash seja reprodutível.
-    let seed = 0x9E3779B9;
-    const next = () => {
-      seed ^= seed << 13; seed |= 0;
-      seed ^= seed >>> 17;
-      seed ^= seed << 5;  seed |= 0;
-      return seed >>> 0;
-    };
+  const MAX_PIECE_CODE = (2 << 3) | 5;          // 21
 
-    const piece = [];   // [cell][pieceCode] -> [h1,h2]
-    const aura  = [];   // [cell][owner]     -> [h1,h2]
-    for (let i = 0; i < R.SIZE; i++) {
-      piece[i] = [];
-      for (let p = 0; p <= 4; p++) piece[i][p] = [next(), next()];
-      aura[i] = [];
-      for (let o = 0; o <= 2; o++) aura[i][o] = [next(), next()];
+  /* ------------------------------------------------------------------ */
+  /* Zobrist hashing (uma tabela por tamanho de tabuleiro)               */
+  /* ------------------------------------------------------------------ */
+  const Zobrist = (function () {
+    const TABLES = new Map();
+
+    function tableFor(size) {
+      const cached = TABLES.get(size);
+      if (cached) return cached;
+
+      // PRNG determinístico (xorshift32): o hash é reprodutível entre sessões.
+      let seed = 0x9E3779B9 ^ size;
+      const next = function () {
+        seed ^= seed << 13; seed |= 0;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;  seed |= 0;
+        return seed >>> 0;
+      };
+
+      const piece = [];   // [casa][código] -> [h1,h2]
+      const aura  = [];   // [casa][dono]   -> [h1,h2]
+      for (let i = 0; i < size; i++) {
+        piece[i] = [];
+        for (let p = 0; p <= MAX_PIECE_CODE; p++) piece[i][p] = [next(), next()];
+        aura[i] = [];
+        for (let o = 0; o <= 2; o++) aura[i][o] = [next(), next()];
+      }
+      const side = [next(), next()];
+
+      const t = { piece: piece, aura: aura, side: side };
+      TABLES.set(size, t);
+      return t;
     }
-    const side = [next(), next()];
 
     function hash(state) {
+      const size = state.arena.SIZE;
+      const t = tableFor(size);
       let h1 = 0, h2 = 0;
-      for (let i = 0; i < R.SIZE; i++) {
+      for (let i = 0; i < size; i++) {
         const p = state.board[i];
-        if (p) { h1 ^= piece[i][p][0]; h2 ^= piece[i][p][1]; }
+        if (p) { h1 ^= t.piece[i][p][0]; h2 ^= t.piece[i][p][1]; }
         const a = state.aura[i];
-        if (a) { h1 ^= aura[i][a][0]; h2 ^= aura[i][a][1]; }
+        if (a) { h1 ^= t.aura[i][a][0]; h2 ^= t.aura[i][a][1]; }
       }
-      if (state.turn === R.B) { h1 ^= side[0]; h2 ^= side[1]; }
+      if (state.turn === R.B) { h1 ^= t.side[0]; h2 ^= t.side[1]; }
       return ((h1 >>> 0).toString(36)) + ':' + ((h2 >>> 0).toString(36));
     }
 
-    return { hash };
+    return { hash: hash, tableFor: tableFor };
   })();
 
   /* ------------------------------------------------------------------ */
-  /* Pesos da avaliação                                                  */
+  /* Pesos                                                               */
   /* ------------------------------------------------------------------ */
+
+  /**
+   * Valor material por tipo. O Guardião vale mais que a Sentinela porque é
+   * imune a salto e pinta 4 casas por lance; o Prisma vale quase o mesmo
+   * (pinta 4, mas é saltável); a Lâmina troca pintura por alcance.
+   */
+  const PIECE_VALUE = {
+    1: 100000,   // Núcleo
+    2: 320,      // Sentinela
+    3: 430,      // Lâmina
+    4: 500,      // Prisma
+    5: 560       // Guardião
+  };
+
   const W = Object.freeze({
-    CORE: 100000,
-    SENTINEL: 320,
     TERRITORY: 26,
     MOBILITY: 4,
     JUMP_THREAT: 46,
     CENTRALITY: 12,
     CORE_LIBERTY: 22,
     CORE_PANIC: 2600,
-    GROUP_PRESSURE: 34,
     ADVANCE: 6,
-    TERRITORY_RUSH: 140    // bônus acelerado perto do limiar de 70%
+    TERRITORY_RUSH: 140,   // aceleração perto do limiar de vitória
+    PORTAL_HOLD: 34,       // ocupar um portal é posição, não sorte
+    RADIATOR_SPACE: 9,     // Prisma/Guardião com espaço livre em volta pintam mais
+    PIECE_VALUE: PIECE_VALUE
   });
 
   /* ------------------------------------------------------------------ */
   /* Avaliação                                                           */
   /* ------------------------------------------------------------------ */
 
-  /** Liberdades do grupo que contém `origin` (flood fill local). */
+  /** Liberdades do grupo que contém `origin`, do ponto de vista do atacante. */
   function groupLiberties(state, origin, attacker) {
+    const arena = state.arena;
     const owner = R.ownerOf(state.board[origin]);
     if (!owner) return 0;
     const seen = new Set([origin]);
@@ -93,7 +124,7 @@
     let liberties = 0;
     while (stack.length) {
       const cur = stack.pop();
-      const neigh = R.ORTHO_NEIGH[cur];
+      const neigh = arena.adjSiege[cur];
       for (let k = 0; k < neigh.length; k++) {
         const nb = neigh[k];
         const cell = state.board[nb];
@@ -107,23 +138,28 @@
     return liberties;
   }
 
-  function coreIndex(state, player) {
-    const target = player === R.A ? R.CORE_A : R.CORE_B;
-    for (let i = 0; i < R.SIZE; i++) if (state.board[i] === target) return i;
-    return -1;
-  }
+  const coreIndex = (state, player) => R.coreIndex(state, player);
 
-  /** Quantos saltos `player` tem disponíveis (pressão tática). */
+  /** Saltos disponíveis para `player` — pressão tática imediata. */
   function countJumpThreats(state, player) {
+    const arena = state.arena;
     let count = 0;
-    for (let i = 0; i < R.SIZE; i++) {
-      if (R.ownerOf(state.board[i]) !== player) continue;
-      const jumps = R.JUMPS[i];
-      for (let d = 0; d < 8; d++) {
-        const j = jumps[d];
+    for (let i = 0; i < arena.SIZE; i++) {
+      const p = state.board[i];
+      if (R.ownerOf(p) !== player) continue;
+      const kind = R.kindOf(p);
+      let dirs;
+      if (kind === R.SENT) dirs = R.ALL_D;
+      else if (kind === R.BLADE) dirs = R.ORTHO_D;
+      else if (kind === R.PRISM) dirs = R.DIAG_D;
+      else continue;                              // Núcleo e Guardião não saltam
+
+      for (let d = 0; d < dirs.length; d++) {
+        const j = arena.geo.JUMPS[i][dirs[d]];
         if (!j) continue;
+        if (arena.blocked[j.mid] || arena.blocked[j.land]) continue;
         const victim = state.board[j.mid];
-        if (R.isSentinel(victim) && R.ownerOf(victim) !== player &&
+        if (R.isJumpable(victim) && R.ownerOf(victim) !== player &&
             state.board[j.land] === R.EMPTY) count++;
       }
     }
@@ -132,9 +168,10 @@
 
   /**
    * Score do ponto de vista de `me` (positivo = bom para `me`).
-   * Todos os termos são simétricos: calcula-se para os dois lados e subtrai.
+   * Todos os termos são simétricos: calculados para os dois lados e subtraídos.
    */
   function evaluate(state, me) {
+    const arena = state.arena;
     const foe = R.opponent(me);
 
     if (state.status === 'finished') {
@@ -143,37 +180,46 @@
       return 0;
     }
 
-    const mine = R.countPieces(state, me);
-    const theirs = R.countPieces(state, foe);
-
     let score = 0;
+    const lastRow = arena.N - 1;
 
-    // 1. Material
-    score += (mine.cores - theirs.cores) * W.CORE;
-    score += (mine.sentinels - theirs.sentinels) * W.SENTINEL;
-
-    // 2. Território (com aceleração perto do limiar de vitória)
-    const t = R.territoryCount(state);
-    const myT = t[me], foeT = t[foe];
-    score += (myT - foeT) * W.TERRITORY;
-    const threshold = R.TERRITORY_THRESHOLD;
-    if (myT > threshold * 0.72) score += (myT - threshold * 0.72) * W.TERRITORY_RUSH;
-    if (foeT > threshold * 0.72) score -= (foeT - threshold * 0.72) * W.TERRITORY_RUSH;
-
-    // 3. Estrutura: centralidade e avanço
-    for (let i = 0; i < R.SIZE; i++) {
+    // 1. Material + estrutura, em uma única varredura
+    for (let i = 0; i < arena.SIZE; i++) {
       const p = state.board[i];
       if (!p) continue;
       const owner = R.ownerOf(p);
+      const kind = R.kindOf(p);
       const sign = owner === me ? 1 : -1;
-      score += sign * R.CENTRALITY[i] * W.CENTRALITY;
-      // avanço em direção ao campo inimigo
-      const row = R.rowOf(i);
-      const advance = owner === R.A ? (8 - row) : row;
-      if (!R.isCore(p)) score += sign * advance * W.ADVANCE;
+
+      score += sign * PIECE_VALUE[kind];
+      score += sign * arena.geo.CENTRALITY[i] * W.CENTRALITY;
+
+      if (kind !== R.CORE) {
+        const row = R.rowOn(arena, i);
+        const advance = owner === R.A ? (lastRow - row) : row;
+        score += sign * advance * W.ADVANCE;
+      }
+
+      if (arena.portal[i] >= 0) score += sign * W.PORTAL_HOLD;
+
+      // peças que irradiam valem mais com vizinhança livre para pintar
+      if (kind === R.PRISM || kind === R.WARDEN) {
+        const beam = R.radiationOf(arena, kind, i);
+        let free = 0;
+        for (let k = 0; k < beam.length; k++) if (state.aura[beam[k]] !== owner) free++;
+        score += sign * free * W.RADIATOR_SPACE;
+      }
     }
 
-    // 4. Segurança do Núcleo
+    // 2. Território (com aceleração perto do limiar)
+    const t = R.territoryCount(state);
+    const myT = t[me], foeT = t[foe];
+    score += (myT - foeT) * W.TERRITORY;
+    const threshold = arena.territoryThreshold;
+    if (myT > threshold * 0.72) score += (myT - threshold * 0.72) * W.TERRITORY_RUSH;
+    if (foeT > threshold * 0.72) score -= (foeT - threshold * 0.72) * W.TERRITORY_RUSH;
+
+    // 3. Segurança do Núcleo
     const myCore = coreIndex(state, me);
     const foeCore = coreIndex(state, foe);
     if (myCore >= 0) {
@@ -189,10 +235,10 @@
       else if (lib === 2) score += W.CORE_PANIC * 0.35;
     }
 
-    // 5. Pressão tática
+    // 4. Pressão tática
     score += (countJumpThreats(state, me) - countJumpThreats(state, foe)) * W.JUMP_THREAT;
 
-    // 6. Mobilidade (cara: só conta para o lado da vez + estimativa do outro)
+    // 5. Mobilidade
     const myMoves = R.generateAllMoves(state, me).length;
     const foeMoves = R.generateAllMoves(state, foe).length;
     score += (myMoves - foeMoves) * W.MOBILITY;
@@ -207,36 +253,52 @@
   /* ------------------------------------------------------------------ */
 
   class SearchEngine {
-    constructor(options = {}) {
-      this.maxDepth = options.depth || 3;
-      this.timeMs = options.timeMs || 1500;
-      this.noise = options.noise || 0;
-      this.quiescenceDepth = options.quiescenceDepth ?? 3;
+    constructor(options) {
+      const o = options || {};
+      this.maxDepth = o.depth || 3;
+      this.timeMs = o.timeMs || 1500;
+      this.noise = o.noise || 0;
+      this.quiescenceDepth = o.quiescenceDepth === undefined ? 3 : o.quiescenceDepth;
       this.tt = new Map();
       this.killers = [];
-      this.history = new Int32Array(R.SIZE * R.SIZE);
+      this.history = null;          // dimensionada na raiz, já sabendo a arena
+      this.size = 0;
       this.nodes = 0;
       this.deadline = 0;
       this.aborted = false;
     }
 
+    _prepare(state) {
+      const size = state.arena.SIZE;
+      if (this.size !== size || !this.history) {
+        this.size = size;
+        this.history = new Int32Array(size * size);
+      }
+      this.centrality = state.arena.geo.CENTRALITY;
+    }
+
     /* --- ordenação --------------------------------------------------- */
 
-    scoreMove(move, ply, ttKey) {
+    scoreMove(move, ply) {
       let s = 0;
-      if (ttKey && move.__ttBest) s += 1e6;
+      if (move.__ttBest) s += 1e6;
       s += move.captures.length * 9000;
       const killer = this.killers[ply];
       if (killer && killer === R.moveKey(move)) s += 4200;
-      s += this.history[move.from * R.SIZE + move.to];
-      s += R.CENTRALITY[move.to] * 120;
+      s += this.history[move.from * this.size + move.to];
+      s += this.centrality[move.to] * 120;
+      // lances que pintam mais casas sobem: território é vitória
+      s += move.path.length * 55;
+      if (move.kind === R.PRISM || move.kind === R.WARDEN) s += 40;
+      if (move.type === 'portal') s += 70;
       return s;
     }
 
     orderMoves(moves, ply, ttMoveKey) {
-      for (const m of moves) {
-        m.__ttBest = ttMoveKey && R.moveKey(m) === ttMoveKey;
-        m.__score = this.scoreMove(m, ply, ttMoveKey);
+      for (let i = 0; i < moves.length; i++) {
+        const m = moves[i];
+        m.__ttBest = !!ttMoveKey && R.moveKey(m) === ttMoveKey;
+        m.__score = this.scoreMove(m, ply);
       }
       moves.sort((a, b) => b.__score - a.__score);
       return moves;
@@ -273,8 +335,8 @@
 
       if (!captures.length) return standPat;
 
-      for (const m of captures) {
-        const child = R.applyMove(state, m);
+      for (let i = 0; i < captures.length; i++) {
+        const child = R.applyMove(state, captures[i]);
         const score = this.quiescence(child, me, alpha, beta, qdepth - 1);
         if (maximizing) {
           if (score >= beta) return beta;
@@ -323,7 +385,7 @@
         const m = moves[i];
         const child = R.applyMove(state, m);
 
-        // Late Move Reduction: movimentos tardios e sem captura vão 1 nível a menos.
+        // Late Move Reduction: lances tardios e sem captura vão 1 nível a menos.
         let reduction = 0;
         if (depth >= 3 && i >= 6 && m.captures.length === 0) reduction = 1;
 
@@ -343,14 +405,14 @@
         if (alpha >= beta) {
           if (m.captures.length === 0) {
             this.killers[ply] = R.moveKey(m);
-            this.history[m.from * R.SIZE + m.to] += depth * depth;
+            this.history[m.from * this.size + m.to] += depth * depth;
           }
           break;
         }
       }
 
       const flag = best <= alphaOrig ? 'UPPER' : (best >= betaOrig ? 'LOWER' : 'EXACT');
-      this.tt.set(key, { depth, score: best, flag, best: bestKey });
+      this.tt.set(key, { depth: depth, score: best, flag: flag, best: bestKey });
       if (this.tt.size > 220000) this.tt.clear();
 
       return best;
@@ -360,6 +422,7 @@
 
     findBestMove(state, player) {
       const started = Date.now();
+      this._prepare(state);
       this.deadline = started + this.timeMs;
       this.nodes = 0;
       this.aborted = false;
@@ -376,12 +439,14 @@
       let reachedDepth = 0;
 
       for (let depth = 1; depth <= this.maxDepth; depth++) {
-        let alpha = -INF, beta = INF;
+        let alpha = -INF;
+        const beta = INF;
         let localBest = null, localScore = -INF;
         const ordered = this.orderMoves(rootMoves.slice(), 0, R.moveKey(bestMove));
 
         try {
-          for (const m of ordered) {
+          for (let i = 0; i < ordered.length; i++) {
+            const m = ordered[i];
             const child = R.applyMove(state, m);
             let score = this.search(child, player, depth - 1, alpha, beta, 1);
 
@@ -401,7 +466,7 @@
           bestScore = localScore;
           reachedDepth = depth;
         }
-        if (Math.abs(bestScore) > MATE / 2) break;         // vitória/derrota forçada
+        if (Math.abs(bestScore) > MATE / 2) break;        // vitória/derrota forçada
         if (Date.now() > this.deadline) break;
       }
 
@@ -417,7 +482,11 @@
 
   /** Remove campos internos antes de cruzar a fronteira do Worker. */
   function strip(m) {
-    return { from: m.from, to: m.to, path: m.path.slice(), captures: m.captures.slice(), type: m.type };
+    return {
+      from: m.from, to: m.to,
+      path: m.path.slice(), captures: m.captures.slice(),
+      type: m.type, kind: m.kind
+    };
   }
 
   /* ------------------------------------------------------------------ */
@@ -428,5 +497,15 @@
     return engine.findBestMove(state, player);
   }
 
-  root.AuraAI = { SearchEngine, evaluate, think, Zobrist, WEIGHTS: W, groupLiberties, coreIndex };
+  root.AuraAI = {
+    SearchEngine: SearchEngine,
+    evaluate: evaluate,
+    think: think,
+    Zobrist: Zobrist,
+    WEIGHTS: W,
+    PIECE_VALUE: PIECE_VALUE,
+    groupLiberties: groupLiberties,
+    coreIndex: coreIndex,
+    countJumpThreats: countJumpThreats
+  };
 })(typeof self !== 'undefined' ? self : this);

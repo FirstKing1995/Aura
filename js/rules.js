@@ -1,111 +1,288 @@
 /**
  * ============================================================================
- *  AURA — Motor de Regras (puro, determinístico, sem DOM)
+ *  AURA — Motor de regras (puro, determinístico, sem DOM)
  * ============================================================================
- *  Este módulo é a ÚNICA fonte de verdade das regras no cliente. É carregado
- *  tanto pela thread principal quanto pelo Web Worker da IA (importScripts),
- *  por isso não pode tocar em `document`, `window` ou `localStorage`.
+ *  Este arquivo é a ÚNICA fonte de verdade das regras. Ele roda em três
+ *  lugares diferentes, byte a byte idêntico:
  *
- *  Espelha 1:1 o objeto `Rules` do Code.gs (servidor autoritativo).
+ *    1. na thread principal do navegador (validação otimista + UI)
+ *    2. dentro do Web Worker da IA (busca Negamax)
+ *    3. dentro do Google Apps Script (árbitro autoritativo do online)
  *
- *  Codificação do tabuleiro (Int8Array de 81 posições):
- *      0 vazio | 1 Núcleo A | 2 Sentinela A | 3 Núcleo B | 4 Sentinela B
- *  Aura (Int8Array de 81 posições):
- *      0 neutro | 1 território de A | 2 território de B
+ *  Por isso: nada de `document`, `window`, `fetch` ou sintaxe que o motor V8
+ *  do Apps Script não aceite. Só matemática.
+ *
+ *  ── Codificação ────────────────────────────────────────────────────────────
+ *  Uma peça cabe em um byte:   peça = (dono << 3) | tipo
+ *      dono: 0 vazio | 1 (A, ciano) | 2 (B, magenta)
+ *      tipo: 1 Núcleo | 2 Sentinela | 3 Lâmina | 4 Prisma | 5 Guardião
+ *  Valor máximo = (2<<3)|5 = 21, o que permite serializar cada casa em UM
+ *  caractere base36 — importante porque o estado inteiro viaja em uma célula
+ *  de planilha a cada polling.
+ *
+ *  ── Movimento por tipo ─────────────────────────────────────────────────────
+ *    Núcleo     1 casa, 8 direções.                    Imune a salto.
+ *    Sentinela  1 casa, 8 direções.                    Salta em 8 direções.
+ *    Lâmina     desliza 1–2 casas, 4 ortogonais.       Salta ortogonal.
+ *    Prisma     desliza 1–2 casas, 4 diagonais.        Salta diagonal.
+ *                 · ao parar, irradia Aura nas 4 diagonais vizinhas
+ *    Guardião   1 casa, 4 ortogonais.                  Imune a salto.
+ *                 · ao parar, irradia Aura nas 4 ortogonais vizinhas
+ *
+ *  Qualquer peça parada sobre um PORTAL pode atravessar para a casa gêmea.
+ *
+ *  ── Ordem de resolução de um lance ─────────────────────────────────────────
+ *    mover → pintar origem/rastro → remover saltadas → irradiar → CERCO →
+ *    checar término
  * ============================================================================
  */
 (function (root) {
   'use strict';
 
-  const N = 9;
-  const SIZE = N * N;
+  const ARENAS = root.AuraArenas;
 
-  const EMPTY = 0, CORE_A = 1, SENT_A = 2, CORE_B = 3, SENT_B = 4;
+  /* ================================================================== */
+  /* 1. Vocabulário                                                     */
+  /* ================================================================== */
+
+  const EMPTY = 0;
   const A = 1, B = 2;
 
-  const DIRS  = [[-1,-1],[-1,0],[-1,1],[0,-1],[0,1],[1,-1],[1,0],[1,1]];
-  const ORTHO = [[-1,0],[1,0],[0,-1],[0,1]];
+  const CORE = 1, SENT = 2, BLADE = 3, PRISM = 4, WARDEN = 5;
 
-  /* ------------------------------------------------------------------ */
-  /* Tabelas de vizinhança pré-computadas (evita recalcular em cada nó)  */
-  /* ------------------------------------------------------------------ */
-  const NEIGHBORS   = new Array(SIZE);   // 8 direções -> índice ou -1
-  const ORTHO_NEIGH = new Array(SIZE);   // 4 direções -> array de índices
-  const JUMPS       = new Array(SIZE);   // 8 direções -> {mid, land} ou null
-  const CENTRALITY  = new Float32Array(SIZE);
+  const KIND_NAMES = { 1: 'core', 2: 'sentinel', 3: 'blade', 4: 'prism', 5: 'warden' };
+  const KIND_FROM_CHAR = { K: CORE, S: SENT, L: BLADE, P: PRISM, G: WARDEN };
 
-  (function precompute() {
+  const OWNER_SHIFT = 3;
+  const KIND_MASK = 7;
+
+  const piece    = (owner, kind) => (owner << OWNER_SHIFT) | kind;
+  const ownerOf  = p => (p ? (p >> OWNER_SHIFT) : 0);
+  const kindOf   = p => (p & KIND_MASK);
+  const opponent = p => (p === A ? B : A);
+
+  const isCore     = p => p !== EMPTY && kindOf(p) === CORE;
+  const isSentinel = p => p !== EMPTY && kindOf(p) === SENT;
+
+  /** Núcleo e Guardião não podem ser saltados: só caem por Cerco. */
+  const isJumpable = p => {
+    if (p === EMPTY) return false;
+    const k = kindOf(p);
+    return k !== CORE && k !== WARDEN;
+  };
+
+  // Aliases herdados da versão de peça única, mantidos para não quebrar
+  // código antigo que ainda fale em CORE_A / SENT_B.
+  const CORE_A = piece(A, CORE), SENT_A = piece(A, SENT);
+  const CORE_B = piece(B, CORE), SENT_B = piece(B, SENT);
+
+  /* ================================================================== */
+  /* 2. Geometria (cacheada por tamanho de tabuleiro)                   */
+  /* ================================================================== */
+
+  const DIRS    = [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]];
+  const ORTHO_D = [1, 3, 4, 6];     // índices dentro de DIRS
+  const DIAG_D  = [0, 2, 5, 7];
+
+  const GEO_CACHE = new Map();
+
+  /**
+   * Tabelas puramente geométricas: não conhecem bloqueios nem portais.
+   * Recalculá-las é caro; cada tamanho é computado uma única vez.
+   */
+  function geometry(N) {
+    const cached = GEO_CACHE.get(N);
+    if (cached) return cached;
+
+    const SIZE = N * N;
+    const NEIGH = new Array(SIZE);    // [8] -> índice ou -1
+    const JUMPS = new Array(SIZE);    // [8] -> {mid, land} ou null
+    const RAYS  = new Array(SIZE);    // [8] -> Int32Array com a reta inteira
+    const CENTRALITY = new Float32Array(SIZE);
+    const mid = (N - 1) / 2;
+
     for (let r = 0; r < N; r++) {
       for (let c = 0; c < N; c++) {
         const i = r * N + c;
 
-        NEIGHBORS[i] = DIRS.map(([dr, dc]) => {
-          const nr = r + dr, nc = c + dc;
+        NEIGH[i] = DIRS.map(function (d) {
+          const nr = r + d[0], nc = c + d[1];
           return (nr >= 0 && nr < N && nc >= 0 && nc < N) ? nr * N + nc : -1;
         });
 
-        ORTHO_NEIGH[i] = ORTHO.map(([dr, dc]) => {
-          const nr = r + dr, nc = c + dc;
-          return (nr >= 0 && nr < N && nc >= 0 && nc < N) ? nr * N + nc : -1;
-        }).filter(x => x >= 0);
-
-        JUMPS[i] = DIRS.map(([dr, dc]) => {
-          const mr = r + dr,     mc = c + dc;
-          const lr = r + dr * 2, lc = c + dc * 2;
+        JUMPS[i] = DIRS.map(function (d) {
+          const mr = r + d[0],     mc = c + d[1];
+          const lr = r + d[0] * 2, lc = c + d[1] * 2;
           if (lr < 0 || lr >= N || lc < 0 || lc >= N) return null;
           return { mid: mr * N + mc, land: lr * N + lc };
         });
 
-        const mid = (N - 1) / 2;
+        RAYS[i] = DIRS.map(function (d) {
+          const line = [];
+          let nr = r + d[0], nc = c + d[1];
+          while (nr >= 0 && nr < N && nc >= 0 && nc < N) {
+            line.push(nr * N + nc);
+            nr += d[0]; nc += d[1];
+          }
+          return Int32Array.from(line);
+        });
+
         const dist = Math.max(Math.abs(r - mid), Math.abs(c - mid));
-        CENTRALITY[i] = 1 - dist / mid;   // 1 no centro, 0 na borda
+        CENTRALITY[i] = 1 - dist / mid;
       }
     }
-  })();
 
-  /* ------------------------------------------------------------------ */
-  /* Primitivas                                                          */
-  /* ------------------------------------------------------------------ */
-  const idx   = (r, c) => r * N + c;
-  const rowOf = i => (i / N) | 0;
-  const colOf = i => i % N;
-
-  function ownerOf(piece) {
-    if (piece === CORE_A || piece === SENT_A) return A;
-    if (piece === CORE_B || piece === SENT_B) return B;
-    return 0;
+    const geo = { N: N, SIZE: SIZE, NEIGH: NEIGH, JUMPS: JUMPS, RAYS: RAYS, CENTRALITY: CENTRALITY };
+    GEO_CACHE.set(N, geo);
+    return geo;
   }
-  const isCore     = p => p === CORE_A || p === CORE_B;
-  const isSentinel = p => p === SENT_A || p === SENT_B;
-  const opponent   = p => (p === A ? B : A);
 
-  /* ------------------------------------------------------------------ */
-  /* Estado                                                              */
-  /* ------------------------------------------------------------------ */
+  /* ================================================================== */
+  /* 3. Compilação de arenas                                            */
+  /* ================================================================== */
 
-  /** Formação inicial: Núcleo na base central + 10 Sentinelas espelhadas. */
-  function createInitialState() {
-    const board = new Int8Array(SIZE);
-    const aura  = new Int8Array(SIZE);
+  const ARENA_CACHE = new Map();
 
-    const backSent  = [1, 2, 3, 5, 6, 7];
-    const frontSent = [2, 3, 5, 6];
+  function assert(cond, message) {
+    if (!cond) throw new Error('[aura/arena] ' + message);
+  }
 
-    board[idx(8, 4)] = CORE_A;
-    backSent.forEach(c => { board[idx(8, c)] = SENT_A; });
-    frontSent.forEach(c => { board[idx(7, c)] = SENT_A; });
+  /**
+   * Transforma a grade de texto em estruturas tipadas e valida as invariantes
+   * que o resto do motor trata como verdade absoluta.
+   */
+  function buildArena(def) {
+    const cached = ARENA_CACHE.get(def.id);
+    if (cached) return cached;
 
-    board[idx(0, 4)] = CORE_B;
-    backSent.forEach(c => { board[idx(0, c)] = SENT_B; });
-    frontSent.forEach(c => { board[idx(1, c)] = SENT_B; });
+    const N = def.N;
+    const SIZE = N * N;
+    const geo = geometry(N);
 
-    for (let i = 0; i < SIZE; i++) {
-      const o = ownerOf(board[i]);
-      if (o) aura[i] = o;
+    assert(def.grid.length === N, def.id + ': a grade tem ' + def.grid.length + ' linhas, esperava ' + N);
+
+    const blocked = new Uint8Array(SIZE);
+    const portal  = new Int32Array(SIZE).fill(-1);
+    const portalBuckets = {};
+    const formation = [];
+
+    for (let r = 0; r < N; r++) {
+      const line = def.grid[r];
+      assert(line.length === N, def.id + ': linha ' + r + ' tem ' + line.length + ' colunas, esperava ' + N);
+
+      for (let c = 0; c < N; c++) {
+        const ch = line.charAt(c);
+        const i = r * N + c;
+
+        if (ch === '.') continue;
+        if (ch === '#') { blocked[i] = 1; continue; }
+
+        if (ch >= '1' && ch <= '9') {
+          if (!portalBuckets[ch]) portalBuckets[ch] = [];
+          portalBuckets[ch].push(i);
+          continue;
+        }
+
+        const kind = KIND_FROM_CHAR[ch];
+        assert(kind, def.id + ': símbolo desconhecido "' + ch + '" em (' + r + ',' + c + ')');
+        formation.push({ index: i, kind: kind });
+      }
     }
 
+    // --- portais: exatamente dois extremos por dígito ------------------
+    Object.keys(portalBuckets).forEach(function (key) {
+      const ends = portalBuckets[key];
+      assert(ends.length === 2, def.id + ': portal "' + key + '" tem ' + ends.length + ' extremos, precisa de 2');
+      portal[ends[0]] = ends[1];
+      portal[ends[1]] = ends[0];
+    });
+
+    // --- simetria central: o terreno precisa ser justo -----------------
+    const mirror = function (i) { return SIZE - 1 - i; };   // rotação de 180°
+    for (let i = 0; i < SIZE; i++) {
+      assert(blocked[i] === blocked[mirror(i)], def.id + ': bloqueio assimétrico na casa ' + i);
+      assert((portal[i] === -1) === (portal[mirror(i)] === -1), def.id + ': portal assimétrico na casa ' + i);
+    }
+
+    // --- exército de A + espelho de B ---------------------------------
+    const pieces = [];
+    let cores = 0;
+    formation.forEach(function (f) {
+      const j = mirror(f.index);
+      assert(!blocked[f.index], def.id + ': peça sobre casa bloqueada (' + f.index + ')');
+      assert(!blocked[j], def.id + ': o espelho da peça ' + f.index + ' cai em casa bloqueada');
+      assert(portal[f.index] === -1, def.id + ': peça começa sobre um portal (' + f.index + ')');
+      pieces.push({ index: f.index, owner: A, kind: f.kind });
+      pieces.push({ index: j, owner: B, kind: f.kind });
+      if (f.kind === CORE) cores++;
+    });
+    assert(cores === 1, def.id + ': cada lado precisa de exatamente 1 Núcleo (achei ' + cores + ')');
+
+    // --- adjacências derivadas ----------------------------------------
+    const adjStep8 = new Array(SIZE);   // passo livre, 8 direções
+    const adjStep4 = new Array(SIZE);   // passo livre, 4 ortogonais
+    const adjSiege = new Array(SIZE);   // ortogonal + portal (conectividade do Cerco)
+
+    for (let i = 0; i < SIZE; i++) {
+      const n8 = [], n4 = [], siege = [];
+      for (let d = 0; d < 8; d++) {
+        const nb = geo.NEIGH[i][d];
+        if (nb < 0 || blocked[nb]) continue;
+        n8.push(nb);
+        if (ORTHO_D.indexOf(d) >= 0) { n4.push(nb); siege.push(nb); }
+      }
+      if (portal[i] >= 0 && !blocked[portal[i]]) siege.push(portal[i]);
+      adjStep8[i] = Int32Array.from(n8);
+      adjStep4[i] = Int32Array.from(n4);
+      adjSiege[i] = Int32Array.from(siege);
+    }
+
+    let playable = 0;
+    for (let i = 0; i < SIZE; i++) if (!blocked[i]) playable++;
+
+    const ratio = def.territoryRatio || 0.70;
+
+    const arena = Object.freeze({
+      id: def.id,
+      order: def.order || 0,
+      level: def.level || 'adept',
+      teaches: def.teaches || [],
+      N: N, SIZE: SIZE, geo: geo,
+      blocked: blocked, portal: portal,
+      adjStep8: adjStep8, adjStep4: adjStep4, adjSiege: adjSiege,
+      pieces: pieces,
+      playable: playable,
+      territoryRatio: ratio,
+      territoryThreshold: Math.ceil(playable * ratio),
+      maxPlies: def.maxPlies || 300,
+      hasPortals: Object.keys(portalBuckets).length > 0
+    });
+
+    ARENA_CACHE.set(def.id, arena);
+    return arena;
+  }
+
+  function arenaById(id) {
+    return buildArena(ARENAS.byId(id));
+  }
+
+  /* ================================================================== */
+  /* 4. Estado                                                          */
+  /* ================================================================== */
+
+  function createInitialState(arenaId) {
+    const arena = arenaById(arenaId || ARENAS.CLASSIC_ID);
+    const board = new Int8Array(arena.SIZE);
+    const aura  = new Int8Array(arena.SIZE);
+
+    arena.pieces.forEach(function (p) {
+      board[p.index] = piece(p.owner, p.kind);
+      aura[p.index] = p.owner;          // cada exército nasce sobre a própria luz
+    });
+
     return {
-      board, aura,
+      arena: arena,
+      board: board, aura: aura,
       turn: A,
       ply: 0,
       status: 'playing',
@@ -117,6 +294,7 @@
 
   function cloneState(s) {
     return {
+      arena: s.arena,
       board: s.board.slice(),
       aura: s.aura.slice(),
       turn: s.turn,
@@ -128,114 +306,214 @@
     };
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Geração de movimentos                                               */
-  /* ------------------------------------------------------------------ */
+  /** Estado a partir de uma descrição declarativa (tutorial, testes). */
+  function fromLayout(layout, auraLayout, arenaId) {
+    const arena = arenaById(arenaId || ARENAS.CLASSIC_ID);
+    const s = {
+      arena: arena,
+      board: new Int8Array(arena.SIZE),
+      aura: new Int8Array(arena.SIZE),
+      turn: A, ply: 0, status: 'playing', winner: null, reason: null, lastMove: null
+    };
+    Object.keys(layout || {}).forEach(function (k) { s.board[Number(k)] = layout[k]; });
+    Object.keys(auraLayout || {}).forEach(function (k) { s.aura[Number(k)] = auraLayout[k]; });
+    return s;
+  }
 
-  /** Passo simples: 1 casa em qualquer das 8 direções, para casa vazia. */
+  /* ---- coordenadas ------------------------------------------------- */
+  const idxOn = function (arena, r, c) { return r * arena.N + c; };
+  const rowOn = function (arena, i) { return (i / arena.N) | 0; };
+  const colOn = function (arena, i) { return i % arena.N; };
+  // versões livres (assumem 9x9 se N não for passado)
+  const idx   = function (r, c, N) { return r * (N || 9) + c; };
+  const rowOf = function (i, N) { return (i / (N || 9)) | 0; };
+  const colOf = function (i, N) { return i % (N || 9); };
+
+  /* ================================================================== */
+  /* 5. Geração de movimentos                                           */
+  /* ================================================================== */
+
+  function mkMove(from, to, path, captures, type, kind) {
+    return { from: from, to: to, path: path, captures: captures, type: type, kind: kind };
+  }
+
+  /** Passo simples de 1 casa no conjunto de direções da peça. */
   function generateStepMoves(state, from, out) {
-    const neigh = NEIGHBORS[from];
-    for (let d = 0; d < 8; d++) {
-      const to = neigh[d];
-      if (to < 0 || state.board[to] !== EMPTY) continue;
-      out.push({ from, to, path: [to], captures: [], type: 'step' });
+    const arena = state.arena;
+    const kind = kindOf(state.board[from]);
+    const list = (kind === WARDEN) ? arena.adjStep4[from] : arena.adjStep8[from];
+    for (let k = 0; k < list.length; k++) {
+      const to = list[k];
+      if (state.board[to] !== EMPTY) continue;
+      out.push(mkMove(from, to, [to], [], 'step', kind));
     }
     return out;
   }
 
   /**
-   * Saltos encadeados (estilo damas). Só Sentinelas inimigas podem ser
-   * saltadas — o Núcleo é imune ao salto e só cai por Cerco.
-   * Retorna apenas sequências maximais (não permite parar no meio da cadeia).
+   * Deslize de até `range` casas numa reta: toda casa atravessada precisa
+   * estar vazia e TODAS entram no `path` — logo, todas são pintadas. É isso
+   * que faz da Lâmina e do Prisma peças de território, não de combate.
    */
-  function generateJumpMoves(state, from, out) {
+  function generateSlideMoves(state, from, dirSet, range, out) {
+    const arena = state.arena;
+    const kind = kindOf(state.board[from]);
+    const rays = arena.geo.RAYS[from];
+
+    for (let d = 0; d < dirSet.length; d++) {
+      const ray = rays[dirSet[d]];
+      const path = [];
+      const limit = Math.min(range, ray.length);
+      for (let step = 0; step < limit; step++) {
+        const cell = ray[step];
+        if (arena.blocked[cell] || state.board[cell] !== EMPTY) break;
+        path.push(cell);
+        out.push(mkMove(from, cell, path.slice(), [], step === 0 ? 'step' : 'slide', kind));
+      }
+    }
+    return out;
+  }
+
+  /** Travessia de portal: 1 lance, disponível para qualquer peça. */
+  function generatePortalMoves(state, from, out) {
+    const arena = state.arena;
+    const exit = arena.portal[from];
+    if (exit < 0) return out;
+    if (arena.blocked[exit] || state.board[exit] !== EMPTY) return out;
+    out.push(mkMove(from, exit, [exit], [], 'portal', kindOf(state.board[from])));
+    return out;
+  }
+
+  /**
+   * Saltos encadeados (busca em profundidade). Só as sequências MAXIMAIS são
+   * legais: se ainda dá para saltar, você é obrigado a continuar — isso
+   * elimina meio-saltos que deixariam a peça pendurada no meio do caminho.
+   */
+  function generateJumpMoves(state, from, dirSet, out) {
+    const arena = state.arena;
     const board = state.board;
     const me = ownerOf(board[from]);
-    const piece = board[from];
-    board[from] = EMPTY;              // a própria peça não bloqueia o pouso
+    const kind = kindOf(board[from]);
+    const jumps = arena.geo.JUMPS;
 
     const path = [];
     const captured = [];
 
-    (function dfs(pos) {
+    const walk = function (pos) {
       let extended = false;
-      const jumps = JUMPS[pos];
-      for (let d = 0; d < 8; d++) {
-        const j = jumps[d];
+
+      for (let d = 0; d < dirSet.length; d++) {
+        const j = jumps[pos][dirSet[d]];
         if (!j) continue;
+        if (arena.blocked[j.mid] || arena.blocked[j.land]) continue;
+
         const victim = board[j.mid];
-        if (!isSentinel(victim) || ownerOf(victim) === me) continue;
-        if (board[j.land] !== EMPTY) continue;
+        if (!isJumpable(victim) || ownerOf(victim) === me) continue;
+        if (captured.indexOf(j.mid) >= 0) continue;            // nunca duas vezes a mesma
+        if (board[j.land] !== EMPTY && j.land !== from) continue;
 
         extended = true;
-        board[j.mid] = EMPTY;
         path.push(j.land);
         captured.push(j.mid);
-
-        dfs(j.land);
-
+        walk(j.land);
         path.pop();
         captured.pop();
-        board[j.mid] = victim;
       }
-      if (!extended && path.length > 0) {
-        out.push({
-          from,
-          to: pos,
-          path: path.slice(),
-          captures: captured.slice(),
-          type: 'jump'
-        });
-      }
-    })(from);
 
-    board[from] = piece;
+      if (!extended && path.length) {
+        out.push(mkMove(from, pos, path.slice(), captured.slice(), 'jump', kind));
+      }
+    };
+
+    walk(from);
     return out;
   }
+
+  const ALL_D = [0, 1, 2, 3, 4, 5, 6, 7];
 
   function generateMovesForPiece(state, from) {
-    if (state.board[from] === EMPTY) return [];
+    const p = state.board[from];
+    if (p === EMPTY) return [];
     const out = [];
-    generateJumpMoves(state, from, out);
-    generateStepMoves(state, from, out);
+
+    switch (kindOf(p)) {
+      case CORE:
+        generateStepMoves(state, from, out);
+        break;
+      case SENT:
+        generateStepMoves(state, from, out);
+        generateJumpMoves(state, from, ALL_D, out);
+        break;
+      case BLADE:
+        generateSlideMoves(state, from, ORTHO_D, 2, out);
+        generateJumpMoves(state, from, ORTHO_D, out);
+        break;
+      case PRISM:
+        generateSlideMoves(state, from, DIAG_D, 2, out);
+        generateJumpMoves(state, from, DIAG_D, out);
+        break;
+      case WARDEN:
+        generateStepMoves(state, from, out);
+        break;
+    }
+
+    generatePortalMoves(state, from, out);
     return out;
   }
 
-  function generateAllMoves(state, player = state.turn) {
+  function generateAllMoves(state, player) {
+    const who = player || state.turn;
     const out = [];
-    for (let i = 0; i < SIZE; i++) {
-      if (ownerOf(state.board[i]) !== player) continue;
-      generateJumpMoves(state, i, out);
-      generateStepMoves(state, i, out);
+    for (let i = 0; i < state.arena.SIZE; i++) {
+      if (ownerOf(state.board[i]) !== who) continue;
+      const moves = generateMovesForPiece(state, i);
+      for (let m = 0; m < moves.length; m++) out.push(moves[m]);
     }
     return out;
   }
 
-  const moveKey = m => `${m.from}>${m.path.join('.')}`;
+  function moveKey(m) { return m.from + '>' + m.path.join('.'); }
 
   function findMove(moves, from, path) {
-    const key = `${from}>${path.join('.')}`;
-    return moves.find(m => moveKey(m) === key) || null;
+    const key = from + '>' + path.join('.');
+    for (let i = 0; i < moves.length; i++) if (moveKey(moves[i]) === key) return moves[i];
+    return null;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Cerco — Flood Fill de grupos e liberdades                           */
-  /* ------------------------------------------------------------------ */
+  /** Usado pelo servidor: regenera os lances legais e confere o recebido. */
+  function findLegalMove(state, from, path) {
+    if (ownerOf(state.board[from]) !== state.turn) return null;
+    return findMove(generateMovesForPiece(state, from), from, path);
+  }
+
+  /** Mapa destino -> movimento, para a UI acender os alvos. */
+  function targetsFor(state, from) {
+    const map = new Map();
+    generateMovesForPiece(state, from).forEach(function (m) {
+      const existing = map.get(m.to);
+      // dois lances terminando na mesma casa: vence o que captura mais
+      if (!existing || m.captures.length > existing.captures.length) map.set(m.to, m);
+    });
+    return map;
+  }
+
+  /* ================================================================== */
+  /* 6. Cerco (Flood Fill)                                              */
+  /* ================================================================== */
 
   /**
-   * Percorre o tabuleiro agrupando peças do `victim` conectadas
-   * ortogonalmente. Uma liberdade é uma casa vazia adjacente ao grupo cuja
-   * Aura NÃO pertence ao `attacker`. Grupos com zero liberdades morrem.
-   *
-   * Complexidade: O(SIZE) amortizado — cada casa é visitada uma única vez.
+   * Um grupo é um conjunto de peças do mesmo dono ligadas ortogonalmente
+   * (portais contam como ligação). Uma "respiração" é uma casa vazia vizinha
+   * cuja Aura NÃO pertence ao atacante — pintar o chão em volta sufoca.
    */
   function findSuffocatedGroups(state, victim, attacker) {
+    const arena = state.arena;
     const board = state.board, aura = state.aura;
-    const visited = new Uint8Array(SIZE);
-    const stack = new Int32Array(SIZE);
+    const visited = new Uint8Array(arena.SIZE);
+    const stack = new Int32Array(arena.SIZE);
     const doomed = [];
 
-    for (let start = 0; start < SIZE; start++) {
+    for (let start = 0; start < arena.SIZE; start++) {
       if (visited[start]) continue;
       if (ownerOf(board[start]) !== victim) continue;
 
@@ -250,44 +528,40 @@
         const cur = stack[--sp];
         group.push(cur);
 
-        const neigh = ORTHO_NEIGH[cur];
+        const neigh = arena.adjSiege[cur];
         for (let k = 0; k < neigh.length; k++) {
           const nb = neigh[k];
           const cell = board[nb];
           if (cell === EMPTY) {
-            // Casa vazia só respira se não estiver dominada pelo atacante.
             if (aura[nb] !== attacker) liberties++;
-          } else if (ownerOf(cell) === victim) {
-            if (!visited[nb]) { visited[nb] = 1; stack[sp++] = nb; }
+          } else if (ownerOf(cell) === victim && !visited[nb]) {
+            visited[nb] = 1;
+            stack[sp++] = nb;
           }
-          // peça inimiga adjacente = parede sólida
         }
       }
 
       if (liberties === 0) doomed.push(group);
     }
+
     return doomed;
   }
 
-  /**
-   * Resolve o cerco ao fim do turno: primeiro sufoca o inimigo, depois
-   * verifica auto-sufocamento (suicídio) de quem jogou.
-   * Retorna a lista de capturas para a camada de animação.
-   */
+  /** Sufoca o inimigo primeiro; depois cobra o suicídio de quem jogou. */
   function resolveSiege(state, attacker) {
     const captured = [];
     const victim = opponent(attacker);
 
-    findSuffocatedGroups(state, victim, attacker).forEach(group => {
-      group.forEach(i => {
+    findSuffocatedGroups(state, victim, attacker).forEach(function (group) {
+      group.forEach(function (i) {
         captured.push({ index: i, piece: state.board[i], by: attacker, kind: 'siege' });
         state.board[i] = EMPTY;
         state.aura[i] = attacker;
       });
     });
 
-    findSuffocatedGroups(state, attacker, victim).forEach(group => {
-      group.forEach(i => {
+    findSuffocatedGroups(state, attacker, victim).forEach(function (group) {
+      group.forEach(function (i) {
         captured.push({ index: i, piece: state.board[i], by: victim, kind: 'suicide' });
         state.board[i] = EMPTY;
         state.aura[i] = victim;
@@ -297,41 +571,53 @@
     return captured;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Território e condições de vitória                                   */
-  /* ------------------------------------------------------------------ */
+  /* ================================================================== */
+  /* 7. Território e término                                            */
+  /* ================================================================== */
 
   function territoryCount(state) {
+    const arena = state.arena;
     const t = [0, 0, 0];
-    for (let i = 0; i < SIZE; i++) t[state.aura[i]]++;
-    return { neutral: t[0], [A]: t[1], [B]: t[2] };
+    for (let i = 0; i < arena.SIZE; i++) {
+      if (arena.blocked[i]) continue;
+      t[state.aura[i]]++;
+    }
+    return { neutral: t[0], 1: t[1], 2: t[2] };
   }
 
-  const territoryRatio = (state, player) => territoryCount(state)[player] / SIZE;
+  function territoryRatio(state, player) {
+    return territoryCount(state)[player] / state.arena.playable;
+  }
 
   function hasCore(state, player) {
-    const target = player === A ? CORE_A : CORE_B;
-    for (let i = 0; i < SIZE; i++) if (state.board[i] === target) return true;
+    const target = piece(player, CORE);
+    for (let i = 0; i < state.arena.SIZE; i++) if (state.board[i] === target) return true;
     return false;
   }
 
-  function countPieces(state, player) {
-    let cores = 0, sentinels = 0;
-    for (let i = 0; i < SIZE; i++) {
-      const p = state.board[i];
-      if (ownerOf(p) !== player) continue;
-      if (isCore(p)) cores++; else sentinels++;
-    }
-    return { cores, sentinels };
+  function coreIndex(state, player) {
+    const target = piece(player, CORE);
+    for (let i = 0; i < state.arena.SIZE; i++) if (state.board[i] === target) return i;
+    return -1;
   }
 
-  const TERRITORY_THRESHOLD = Math.ceil(SIZE * 0.70);   // 57 de 81
-
-  /**
-   * Trava de segurança: duas Auras bem defendidas podem repintar as mesmas
-   * casas indefinidamente. Ao atingir o teto, arbitra-se pelo território.
-   */
-  const MAX_PLIES = 300;
+  /** Contagem por tipo — alimenta o HUD e a avaliação da IA. */
+  function countPieces(state, player) {
+    const out = { cores: 0, sentinels: 0, blades: 0, prisms: 0, wardens: 0, total: 0, minions: 0 };
+    for (let i = 0; i < state.arena.SIZE; i++) {
+      const p = state.board[i];
+      if (ownerOf(p) !== player) continue;
+      out.total++;
+      switch (kindOf(p)) {
+        case CORE:   out.cores++; break;
+        case SENT:   out.sentinels++; out.minions++; break;
+        case BLADE:  out.blades++;    out.minions++; break;
+        case PRISM:  out.prisms++;    out.minions++; break;
+        case WARDEN: out.wardens++;   out.minions++; break;
+      }
+    }
+    return out;
+  }
 
   function evaluateTermination(state) {
     const aCore = hasCore(state, A);
@@ -341,43 +627,70 @@
     if (!aCore) return { winner: B, reason: 'core' };
 
     const t = territoryCount(state);
-    if (t[A] >= TERRITORY_THRESHOLD) return { winner: A, reason: 'territory' };
-    if (t[B] >= TERRITORY_THRESHOLD) return { winner: B, reason: 'territory' };
+    const threshold = state.arena.territoryThreshold;
+    if (t[A] >= threshold) return { winner: A, reason: 'territory' };
+    if (t[B] >= threshold) return { winner: B, reason: 'territory' };
 
     if (generateAllMoves(state, state.turn).length === 0) {
       return { winner: opponent(state.turn), reason: 'stalemate' };
     }
 
-    if (state.ply >= MAX_PLIES) {
+    // Trava anti-loop: duas Auras bem defendidas repintam as mesmas casas
+    // indefinidamente. No teto, arbitra-se pelo território.
+    if (state.ply >= state.arena.maxPlies) {
       if (t[A] === t[B]) return { winner: 0, reason: 'adjudication' };
       return { winner: t[A] > t[B] ? A : B, reason: 'adjudication' };
     }
     return null;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Aplicação de jogada                                                 */
-  /* ------------------------------------------------------------------ */
+  /* ================================================================== */
+  /* 8. Aplicação de jogada                                             */
+  /* ================================================================== */
 
-  /**
-   * Aplica um movimento e devolve um NOVO estado (imutável para o chamador).
-   * Ordem: mover -> pintar Aura -> remover saltadas -> Cerco -> término.
-   */
+  /** Casas que a peça acende ao PARAR (Prisma e Guardião). */
+  function radiationOf(arena, kind, at) {
+    if (kind === WARDEN) return arena.adjStep4[at];
+    if (kind === PRISM) {
+      const out = [];
+      for (let d = 0; d < DIAG_D.length; d++) {
+        const nb = arena.geo.NEIGH[at][DIAG_D[d]];
+        if (nb >= 0 && !arena.blocked[nb]) out.push(nb);
+      }
+      return out;
+    }
+    return null;
+  }
+
+  /** Aplica um lance e devolve um NOVO estado (o original fica intacto). */
   function applyMove(state, move) {
+    const arena = state.arena;
     const next = cloneState(state);
-    const piece = next.board[move.from];
-    const player = ownerOf(piece);
+    const moving = next.board[move.from];
+    const player = ownerOf(moving);
+    const kind = kindOf(moving);
 
     next.board[move.from] = EMPTY;
-    next.aura[move.from] = player;                      // "a casa onde passou"
+    if (!arena.blocked[move.from]) next.aura[move.from] = player;
 
     for (let i = 0; i < move.path.length; i++) next.aura[move.path[i]] = player;
+
     for (let i = 0; i < move.captures.length; i++) {
       next.aura[move.captures[i]] = player;
       next.board[move.captures[i]] = EMPTY;
     }
 
-    next.board[move.to] = piece;
+    next.board[move.to] = moving;
+
+    // irradiação (Prisma / Guardião)
+    const radiated = [];
+    const beam = radiationOf(arena, kind, move.to);
+    if (beam) {
+      for (let k = 0; k < beam.length; k++) {
+        const cell = beam[k];
+        if (next.aura[cell] !== player) { next.aura[cell] = player; radiated.push(cell); }
+      }
+    }
 
     const siege = resolveSiege(next, player);
 
@@ -388,9 +701,11 @@
       to: move.to,
       path: move.path.slice(),
       jumpCaptures: move.captures.slice(),
-      siegeCaptures: siege.map(c => c.index),
+      siegeCaptures: siege.map(function (c) { return c.index; }),
       siegeDetail: siege,
+      radiated: radiated,
       by: player,
+      kind: kind,
       type: move.type
     };
 
@@ -403,14 +718,21 @@
     return next;
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Serialização compacta (mesma do servidor)                           */
-  /* ------------------------------------------------------------------ */
+  /* ================================================================== */
+  /* 9. Serialização (uma casa = um caractere base36)                   */
+  /* ================================================================== */
 
   function serialize(state) {
+    let b = '', a = '';
+    for (let i = 0; i < state.arena.SIZE; i++) {
+      b += state.board[i].toString(36);
+      a += String(state.aura[i]);
+    }
     return {
-      b: Array.from(state.board).join(''),
-      a: Array.from(state.aura).join(''),
+      v: 2,
+      ar: state.arena.id,
+      b: b,
+      a: a,
       t: state.turn,
       p: state.ply,
       s: state.status,
@@ -422,15 +744,18 @@
 
   function deserialize(o) {
     if (!o) return createInitialState();
-    if (typeof o === 'string') { try { o = JSON.parse(o); } catch (e) { return createInitialState(); } }
-    const board = new Int8Array(SIZE);
-    const aura  = new Int8Array(SIZE);
-    for (let i = 0; i < SIZE; i++) {
-      board[i] = Number(o.b[i]) || 0;
-      aura[i]  = Number(o.a[i]) || 0;
+    if (typeof o === 'string') {
+      try { o = JSON.parse(o); } catch (e) { return createInitialState(); }
+    }
+    const arena = arenaById(o.ar);
+    const board = new Int8Array(arena.SIZE);
+    const aura  = new Int8Array(arena.SIZE);
+    for (let i = 0; i < arena.SIZE; i++) {
+      board[i] = parseInt(o.b.charAt(i), 36) || 0;
+      aura[i]  = Number(o.a.charAt(i)) || 0;
     }
     return {
-      board, aura,
+      arena: arena, board: board, aura: aura,
       turn: o.t,
       ply: o.p,
       status: o.s,
@@ -440,44 +765,40 @@
     };
   }
 
-  /* ------------------------------------------------------------------ */
-  /* Utilidades para a UI                                                */
-  /* ------------------------------------------------------------------ */
-
-  /** Mapa índiceDestino -> movimento, para desenhar os alvos válidos. */
-  function targetsFor(state, from) {
-    const map = new Map();
-    generateMovesForPiece(state, from).forEach(m => {
-      const existing = map.get(m.to);
-      // prioriza o salto (mais capturas) quando dois movimentos terminam igual
-      if (!existing || m.captures.length > existing.captures.length) map.set(m.to, m);
-    });
-    return map;
-  }
-
-  /** Cria um estado a partir de uma descrição declarativa (tutorial/testes). */
-  function fromLayout(layout, auraLayout) {
-    const s = {
-      board: new Int8Array(SIZE),
-      aura: new Int8Array(SIZE),
-      turn: A, ply: 0, status: 'playing', winner: null, reason: null, lastMove: null
-    };
-    Object.entries(layout || {}).forEach(([i, piece]) => { s.board[Number(i)] = piece; });
-    Object.entries(auraLayout || {}).forEach(([i, owner]) => { s.aura[Number(i)] = owner; });
-    return s;
-  }
+  /* ================================================================== */
 
   root.AuraRules = {
-    N, SIZE, A, B, EMPTY, CORE_A, SENT_A, CORE_B, SENT_B,
-    DIRS, ORTHO, NEIGHBORS, ORTHO_NEIGH, JUMPS, CENTRALITY,
-    TERRITORY_THRESHOLD, MAX_PLIES,
-    idx, rowOf, colOf, ownerOf, isCore, isSentinel, opponent,
-    createInitialState, cloneState, fromLayout,
-    generateStepMoves, generateJumpMoves, generateMovesForPiece, generateAllMoves,
-    moveKey, findMove, targetsFor,
-    findSuffocatedGroups, resolveSiege,
-    territoryCount, territoryRatio, hasCore, countPieces,
-    evaluateTermination, applyMove,
-    serialize, deserialize
+    // vocabulário
+    A: A, B: B, EMPTY: EMPTY,
+    CORE: CORE, SENT: SENT, BLADE: BLADE, PRISM: PRISM, WARDEN: WARDEN,
+    KIND_NAMES: KIND_NAMES,
+    CORE_A: CORE_A, SENT_A: SENT_A, CORE_B: CORE_B, SENT_B: SENT_B,
+    DIRS: DIRS, ORTHO_D: ORTHO_D, DIAG_D: DIAG_D, ALL_D: ALL_D,
+
+    piece: piece, ownerOf: ownerOf, kindOf: kindOf, opponent: opponent,
+    isCore: isCore, isSentinel: isSentinel, isJumpable: isJumpable,
+    idx: idx, rowOf: rowOf, colOf: colOf, idxOn: idxOn, rowOn: rowOn, colOn: colOn,
+
+    // arenas
+    geometry: geometry, buildArena: buildArena, arenaById: arenaById,
+
+    // estado
+    createInitialState: createInitialState, cloneState: cloneState, fromLayout: fromLayout,
+
+    // movimentos
+    generateStepMoves: generateStepMoves, generateSlideMoves: generateSlideMoves,
+    generatePortalMoves: generatePortalMoves, generateJumpMoves: generateJumpMoves,
+    generateMovesForPiece: generateMovesForPiece, generateAllMoves: generateAllMoves,
+    moveKey: moveKey, findMove: findMove, findLegalMove: findLegalMove, targetsFor: targetsFor,
+
+    // cerco / território
+    findSuffocatedGroups: findSuffocatedGroups, resolveSiege: resolveSiege,
+    radiationOf: radiationOf,
+    territoryCount: territoryCount, territoryRatio: territoryRatio,
+    hasCore: hasCore, coreIndex: coreIndex, countPieces: countPieces,
+
+    // ciclo
+    evaluateTermination: evaluateTermination, applyMove: applyMove,
+    serialize: serialize, deserialize: deserialize
   };
 })(typeof self !== 'undefined' ? self : this);

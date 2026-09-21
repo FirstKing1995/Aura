@@ -1,16 +1,21 @@
 /**
  * AURA — Web Worker da IA.
- * Mantém a busca Minimax fora da thread principal para que o tabuleiro,
- * as animações CSS e o polling continuem fluidos durante o "pensamento".
+ * Mantém a busca Negamax fora da thread principal para que o tabuleiro,
+ * as animações CSS, o áudio e o polling continuem fluidos durante o
+ * "pensamento" da máquina.
  *
  * Protocolo:
  *   main -> worker : { type:'think', id, state, player, options }
  *   worker -> main : { type:'ready' | 'result' | 'error', id, ... }
+ *
+ * O estado cruza a fronteira SERIALIZADO (string compacta), nunca como
+ * objeto vivo: Int8Array e a arena compilada não sobrevivem ao structured
+ * clone de forma confiável entre navegadores antigos.
  */
 /* eslint-env worker */
 'use strict';
 
-importScripts('rules.js', 'ai.js');
+importScripts('config.js', 'arenas.js', 'rules.js', 'ai.js');
 
 self.onmessage = function (e) {
   const msg = e.data || {};

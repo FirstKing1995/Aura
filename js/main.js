@@ -8,15 +8,23 @@
 
   function fail(message) {
     document.body.innerHTML =
-      `<div class="fatal"><h1>Aura</h1><p>${message}</p></div>`;
+      '<div class="fatal"><h1>Aura</h1><p>' + message + '</p></div>';
   }
 
   function start() {
-    const required = ['AURA_CONFIG', 'AuraUtils', 'AuraRules', 'AuraI18n',
-                      'AuraApi', 'AuraNet', 'AuraAI', 'AuraBot', 'AuraUI',
+    const required = ['AURA_CONFIG', 'AuraUtils', 'AuraArenas', 'AuraRules', 'AuraI18n',
+                      'AuraAudio', 'AuraApi', 'AuraNet', 'AuraAI', 'AuraBot', 'AuraUI',
                       'AuraTutorial', 'AuraGame'];
     const missing = required.filter(k => !root[k]);
     if (missing.length) return fail('Módulos ausentes: ' + missing.join(', '));
+
+    // Falha alto se alguma arena estiver mal descrita: melhor uma tela de erro
+    // clara agora do que um tabuleiro sutilmente injusto depois.
+    try {
+      root.AuraArenas.ALL.forEach(def => root.AuraRules.buildArena(def));
+    } catch (err) {
+      return fail('Arena inválida: ' + err.message);
+    }
 
     const bus = new root.AuraUtils.EventBus();
     root.AuraI18n.init();
@@ -25,11 +33,11 @@
     new root.AuraNet.ConnectionMonitor(bus);
 
     const game = new root.AuraGame.GameController(ui, bus);
-    root.__aura = { bus, ui, game };   // superfície de depuração
+    root.__aura = { bus, ui, game, audio: root.AuraAudio };   // superfície de depuração
 
-    // Ajusta a altura real da viewport no mobile (barra de endereço dinâmica).
+    // Altura real da viewport no mobile (barra de endereço dinâmica).
     const setVh = () => {
-      document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
+      document.documentElement.style.setProperty('--vh', (window.innerHeight * 0.01) + 'px');
     };
     setVh();
     window.addEventListener('resize', setVh);

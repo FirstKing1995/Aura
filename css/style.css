@@ -611,8 +611,8 @@ h1, h2, h3, p { margin: 0; }
 
 .board__grid {
   display: grid;
-  grid-template-columns: repeat(9, 1fr);
-  grid-template-rows: repeat(9, 1fr);
+  grid-template-columns: repeat(var(--n, 9), 1fr);
+  grid-template-rows: repeat(var(--n, 9), 1fr);
   gap: 2px;
   width: 100%; height: 100%;
   perspective: 620px;
@@ -999,4 +999,395 @@ body.is-tutorial .turn { visibility: hidden; }
 
 @media (prefers-contrast: more) {
   :root { --ink-mute: rgba(238,242,255,.62); --edge: rgba(255,255,255,.22); }
+}
+
+/* ==========================================================================
+   v2.0 — ARENAS, PEÇAS, ÁUDIO, CAMPANHA, CÓDEX E ANIMAÇÕES
+   Tudo abaixo é aditivo: sobrescreve a base só onde a v2 muda o jogo.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   V1. Tabuleiro de tamanho variável (9 / 11 / 13)
+   -------------------------------------------------------------------------- */
+.board { --n: 9; }
+.board[data-density="dense"] { padding: 6px; }
+.board[data-density="dense"] .board__grid { gap: 1.5px; }
+.board[data-density="dense"] .cell { border-radius: 6px; }
+.board[data-density="dense"] .piece { width: 84%; height: 84%; }
+.board[data-density="dense"] .piece__glow { filter: blur(4px); opacity: .55; }
+.board[data-density="dense"] .piece--core::after { border-width: 1px; }
+
+/* abismo: casa bloqueada, afundada no vidro */
+.cell--void {
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 50% 55%, rgba(0,0,0,.85), rgba(0,0,0,.4) 70%),
+    repeating-linear-gradient(135deg, rgba(255,255,255,.025) 0 3px, transparent 3px 7px);
+  box-shadow: inset 0 3px 8px rgba(0,0,0,.9), inset 0 -1px 0 rgba(255,255,255,.04);
+}
+.cell--void .cell__aura, .cell--void .cell__marker { display: none; }
+
+/* portal: anel giratório com núcleo de luz branca */
+.cell--portal::before {
+  content: '';
+  position: absolute; inset: 14%;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, rgba(180,140,255,.0), rgba(180,140,255,.85),
+              rgba(120,220,255,.85), rgba(180,140,255,.0));
+  -webkit-mask: radial-gradient(circle, transparent 46%, #000 48%, #000 62%, transparent 64%);
+          mask: radial-gradient(circle, transparent 46%, #000 48%, #000 62%, transparent 64%);
+  animation: spin 3.6s linear infinite;
+  pointer-events: none;
+}
+.cell--portal::after {
+  content: '';
+  position: absolute; inset: 36%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,255,255,.8), rgba(170,150,255,.15) 70%);
+  animation: portal-breathe 2.4s ease-in-out infinite;
+  pointer-events: none;
+}
+.cell--portal-active::before { animation-duration: .5s; filter: brightness(1.8); }
+.cell--portal-active::after  { animation: portal-flash 420ms ease-out; }
+@keyframes portal-breathe { 50% { transform: scale(1.35); opacity: .6; } }
+@keyframes portal-flash   { 0% { transform: scale(1); } 45% { transform: scale(2.6); opacity: 1; } 100% { transform: scale(1); } }
+
+/* novos marcadores de destino */
+.cell--target-portal .cell__marker { background: #b89cff; box-shadow: 0 0 12px #b89cff; opacity: .9; }
+.cell--target-slide .cell__marker  { border-radius: 30%; width: 26%; height: 26%; }
+.cell--trail { background: rgba(255,255,255,.06); }
+.cell--trail .cell__marker { opacity: .22; transform: scale(.6); }
+
+/* ripple do toque */
+.cell__ripple {
+  position: absolute; inset: 0; margin: auto;
+  width: 30%; height: 30%;
+  border-radius: 50%;
+  background: rgba(255,255,255,.35);
+  opacity: 0; pointer-events: none;
+}
+.cell--rippling .cell__ripple { animation: ripple 520ms ease-out; }
+@keyframes ripple { 0% { opacity: .6; transform: scale(.3); } 100% { opacity: 0; transform: scale(3.2); } }
+
+/* irradiação (Prisma / Guardião) */
+.cell--radiating { animation: radiate-core 520ms ease-out; z-index: 2; }
+.cell--beam { animation: beam 520ms ease-out; }
+@keyframes radiate-core {
+  0%   { box-shadow: 0 0 0 0 rgba(255,255,255,.9); }
+  100% { box-shadow: 0 0 0 14px rgba(255,255,255,0); }
+}
+@keyframes beam {
+  0%   { filter: brightness(3); transform: scale(.85); }
+  60%  { transform: scale(1.1); }
+  100% { filter: none; transform: none; }
+}
+
+/* Núcleo sem ar: anel vermelho pulsando */
+.cell--core-danger { animation: core-danger 900ms ease-in-out infinite; }
+@keyframes core-danger {
+  0%, 100% { box-shadow: inset 0 0 0 1.5px rgba(255,107,129,.5); }
+  50%      { box-shadow: inset 0 0 0 3px var(--bad), 0 0 18px -4px var(--bad); }
+}
+
+/* entrada em cascata diagonal */
+.board--intro .cell { animation: cell-drop 520ms cubic-bezier(.3,1.4,.5,1) both; animation-delay: var(--cell-delay, 0ms); }
+.board--intro .piece { animation-delay: calc(var(--cell-delay, 0ms) + 120ms); }
+@keyframes cell-drop {
+  from { opacity: 0; transform: translateY(-14px) scale(.6) rotateX(50deg); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* tremor de tela nas capturas */
+.board--shake        { animation: board-shake 340ms ease; }
+.board--shake-strong { animation: board-shake-strong 340ms ease; }
+.board--flipped.board--shake        { animation: board-shake-flip 340ms ease; }
+.board--flipped.board--shake-strong { animation: board-shake-flip 340ms ease; }
+@keyframes board-shake        { 25% { transform: translate(-3px, 1px); } 75% { transform: translate(3px, -1px); } }
+@keyframes board-shake-strong { 20% { transform: translate(-6px, 2px) rotate(-.6deg); } 50% { transform: translate(5px, -3px) rotate(.5deg); } 80% { transform: translate(-3px, 1px); } }
+@keyframes board-shake-flip   { 0%,100% { transform: rotate(180deg); } 30% { transform: rotate(180deg) translate(-4px, 2px); } 70% { transform: rotate(180deg) translate(4px, -2px); } }
+
+/* --------------------------------------------------------------------------
+   V2. As cinco peças — cada uma com silhueta própria
+   -------------------------------------------------------------------------- */
+.piece__base {
+  position: absolute; left: 12%; right: 12%; bottom: -6%;
+  height: 22%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse, rgba(0,0,0,.65), transparent 70%);
+  filter: blur(2px);
+  pointer-events: none;
+}
+.piece__crest {
+  position: absolute; inset: 30%;
+  pointer-events: none;
+  background: rgba(255,255,255,.85);
+  filter: drop-shadow(0 0 4px var(--tone));
+}
+
+/* Núcleo — octógono com anel orbital (herdado) + estrela interna */
+.piece--core .piece__crest {
+  inset: 32%;
+  clip-path: polygon(50% 0, 61% 39%, 100% 50%, 61% 61%, 50% 100%, 39% 61%, 0 50%, 39% 39%);
+  animation: spin 9s linear infinite reverse;
+}
+
+/* Sentinela — pastilha arredondada com ponto */
+.piece--sentinel .piece__crest { inset: 38%; border-radius: 50%; }
+
+/* Lâmina — losango esticado na vertical, crista em faca */
+.piece--blade .piece__body {
+  border-radius: 22%;
+  clip-path: polygon(50% 0, 88% 22%, 88% 78%, 50% 100%, 12% 78%, 12% 22%);
+}
+.piece--blade .piece__crest {
+  inset: 18% 42%;
+  clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+}
+
+/* Prisma — triângulo facetado que refrata */
+.piece--prism .piece__body {
+  clip-path: polygon(50% 2%, 98% 88%, 2% 88%);
+  border-radius: 0;
+  background:
+    linear-gradient(120deg, rgba(255,255,255,.7), rgba(255,255,255,0) 40%),
+    conic-gradient(from 200deg, var(--tone), #fff5a8, var(--tone-deep), var(--tone));
+}
+.piece--prism .piece__crest {
+  inset: 42% 38% 24%;
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+  animation: prism-shimmer 2.6s ease-in-out infinite;
+}
+@keyframes prism-shimmer { 50% { filter: drop-shadow(0 0 8px #fff) hue-rotate(40deg); } }
+
+/* Guardião — escudo quadrado com cruz */
+.piece--warden .piece__body {
+  border-radius: 18%;
+  box-shadow:
+    0 8px 14px -5px rgba(0,0,0,.85),
+    inset 0 2px 0 rgba(255,255,255,.7),
+    inset 0 -4px 8px rgba(0,0,0,.5),
+    inset 0 0 0 2px rgba(255,255,255,.18);
+}
+.piece--warden .piece__crest {
+  inset: 26%;
+  clip-path: polygon(38% 0, 62% 0, 62% 38%, 100% 38%, 100% 62%, 62% 62%, 62% 100%, 38% 100%, 38% 62%, 0 62%, 0 38%, 38% 38%);
+}
+
+/* nascimento e dobra de portal */
+.piece--spawn { animation: piece-in 380ms cubic-bezier(.3,1.5,.5,1) both; }
+.piece--warp-out { animation: warp-out 210ms ease-in forwards; }
+.piece--warp-in  { animation: warp-in 210ms cubic-bezier(.3,1.6,.5,1) both; }
+@keyframes warp-out { to { opacity: 0; filter: brightness(3) blur(2px); scale: .1; rotate: 160deg; } }
+@keyframes warp-in  { from { opacity: 0; filter: brightness(3) blur(2px); scale: 1.8; rotate: -120deg; } to { opacity: 1; filter: none; scale: 1; rotate: 0deg; } }
+
+/* vitrine do códex */
+.piece--showcase { position: relative; inset: auto; width: 54px; height: 54px; animation: showcase-float 3.2s ease-in-out infinite; }
+@keyframes showcase-float { 50% { transform: translateY(-4px) rotate(-3deg); } }
+
+/* --------------------------------------------------------------------------
+   V3. HUD da partida: faixa da arena e mini-exército
+   -------------------------------------------------------------------------- */
+.arena-strip {
+  display: flex; justify-content: space-between; align-items: baseline;
+  padding: 0 4px;
+  font-family: var(--font-display);
+}
+.arena-strip__name { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-soft); }
+.arena-strip__ply  { font-size: 12px; color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+
+.player { flex-wrap: wrap; }
+.roster { display: flex; gap: 8px; width: 100%; padding-top: 4px; }
+.roster:empty { display: none; }
+.roster__item { display: inline-flex; align-items: center; gap: 3px; font-size: 11px; color: var(--ink-soft); }
+.roster__glyph {
+  width: 10px; height: 10px;
+  background: currentColor;
+  opacity: .8;
+}
+.roster__item[data-kind="core"]     .roster__glyph { clip-path: polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%); }
+.roster__item[data-kind="sentinel"] .roster__glyph { border-radius: 50%; }
+.roster__item[data-kind="blade"]    .roster__glyph { clip-path: polygon(50% 0,88% 22%,88% 78%,50% 100%,12% 78%,12% 22%); }
+.roster__item[data-kind="prism"]    .roster__glyph { clip-path: polygon(50% 0,100% 90%,0 90%); }
+.roster__item[data-kind="warden"]   .roster__glyph { border-radius: 2px; }
+.player[data-side="a"] .roster { color: var(--aura-a); }
+.player[data-side="b"] .roster { color: var(--aura-b); }
+.roster__n { color: var(--ink-soft); }
+
+/* --------------------------------------------------------------------------
+   V4. Botão de som e mixer
+   -------------------------------------------------------------------------- */
+.audio-toggle {
+  display: inline-flex; align-items: flex-end; gap: 2px;
+  height: 30px; padding: 0 9px 8px;
+  border-radius: var(--r-pill);
+  background: var(--mist);
+  border: 1px solid var(--edge);
+  cursor: pointer;
+}
+.audio-toggle__wave {
+  width: 3px; height: 6px;
+  border-radius: 2px;
+  background: var(--aura-a);
+  animation: eq 900ms ease-in-out infinite;
+}
+.audio-toggle__wave:nth-child(2) { animation-delay: -300ms; background: #8fd0ff; }
+.audio-toggle__wave:nth-child(3) { animation-delay: -600ms; background: var(--aura-b); }
+@keyframes eq { 0%,100% { height: 5px; } 50% { height: 14px; } }
+.audio-toggle[data-on="false"] .audio-toggle__wave { animation: none; height: 3px; background: var(--ink-mute); }
+
+.mixer { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; }
+.slider { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 12px; }
+.slider__label { font-size: 13px; color: var(--ink-soft); }
+.slider__input {
+  -webkit-appearance: none; appearance: none;
+  width: 100%; height: 6px;
+  border-radius: var(--r-pill);
+  background: linear-gradient(90deg, var(--aura-a), var(--aura-b));
+  box-shadow: var(--neu-in);
+  outline: none;
+}
+.slider__input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--ink);
+  box-shadow: 0 2px 8px rgba(0,0,0,.6), 0 0 0 4px rgba(255,255,255,.08);
+}
+.slider__input::-moz-range-thumb {
+  width: 20px; height: 20px; border: 0; border-radius: 50%;
+  background: var(--ink);
+}
+
+/* --------------------------------------------------------------------------
+   V5. Menu: campanha e códex
+   -------------------------------------------------------------------------- */
+.tile--campaign {
+  position: relative;
+  background:
+    linear-gradient(120deg, rgba(36,232,255,.16), rgba(255,63,208,.16)),
+    var(--mist);
+}
+.tile__badge {
+  position: absolute; right: 16px; top: 50%; transform: translateY(-50%);
+  font-family: var(--font-display); font-size: 13px;
+  padding: 3px 10px; border-radius: var(--r-pill);
+  background: rgba(0,0,0,.35); color: var(--ink-soft);
+}
+.tile--quiet { padding: 14px 16px; opacity: .85; }
+
+.pane--wide { width: min(94vw, 520px); }
+.pane__sub  { color: var(--ink-soft); font-size: 14px; margin-top: -8px; }
+.pane__meta { color: var(--ink-mute); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+.tag--quiet { background: rgba(255,255,255,.06); color: var(--ink-soft); border-color: transparent; }
+
+.phases { display: flex; flex-direction: column; gap: 10px; max-height: 58vh; overflow-y: auto; padding-right: 2px; }
+.phase {
+  display: grid; grid-template-columns: 38px 1fr auto; gap: 12px; align-items: center;
+  text-align: left;
+  padding: 14px;
+  border-radius: var(--r-md);
+  background: var(--mist);
+  border: 1px solid var(--edge);
+  box-shadow: var(--neu);
+  color: var(--ink);
+  cursor: pointer;
+  transition: transform 180ms, border-color 220ms;
+  animation: phase-in 420ms cubic-bezier(.3,1.3,.5,1) both;
+}
+.phase:nth-child(2) { animation-delay: 60ms; }
+.phase:nth-child(3) { animation-delay: 120ms; }
+.phase:nth-child(4) { animation-delay: 180ms; }
+.phase:nth-child(5) { animation-delay: 240ms; }
+.phase:nth-child(6) { animation-delay: 300ms; }
+@keyframes phase-in { from { opacity: 0; transform: translateX(-18px); } }
+.phase:active { transform: scale(.98); }
+.phase__index {
+  width: 38px; height: 38px; display: grid; place-items: center;
+  border-radius: 12px;
+  font-family: var(--font-display); font-weight: 700;
+  background: linear-gradient(145deg, rgba(36,232,255,.35), rgba(255,63,208,.25));
+  box-shadow: var(--inset);
+}
+.phase__body { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.phase__name { font-family: var(--font-display); font-size: 15px; font-weight: 500; }
+.phase__desc { font-size: 12px; color: var(--ink-soft); line-height: 1.35; }
+.phase__tags { display: flex; gap: 6px; margin-top: 4px; }
+.phase__tags .tag { font-size: 10px; padding: 2px 8px; }
+.phase--cleared { border-color: rgba(242,193,78,.35); }
+.phase--locked { opacity: .45; filter: saturate(.3); box-shadow: none; }
+.phase--locked .phase__index { background: rgba(255,255,255,.06); }
+.phase--locked .phase__index::after { content: ''; }
+
+/* estrelas (campanha e resultado) */
+.phase__stars, .stars { display: flex; gap: 3px; }
+.star {
+  width: 14px; height: 14px;
+  background: rgba(255,255,255,.14);
+  clip-path: polygon(50% 0, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
+}
+.phase__stars[data-stars="1"] .star:nth-child(-n+1),
+.phase__stars[data-stars="2"] .star:nth-child(-n+2),
+.phase__stars[data-stars="3"] .star:nth-child(-n+3) { background: var(--div-gold); filter: drop-shadow(0 0 4px rgba(242,193,78,.7)); }
+
+.stars { justify-content: center; gap: 10px; margin: 2px 0 4px; }
+.stars .star { width: 34px; height: 34px; }
+.stars .star--on {
+  background: linear-gradient(160deg, #fff3c4, var(--div-gold));
+  animation: star-pop 520ms cubic-bezier(.3,1.8,.5,1) both;
+  filter: drop-shadow(0 0 10px rgba(242,193,78,.8));
+}
+@keyframes star-pop { from { transform: scale(0) rotate(-90deg); opacity: 0; } }
+
+/* códex */
+.codex { list-style: none; display: flex; flex-direction: column; gap: 10px; max-height: 60vh; overflow-y: auto; }
+.codex-row {
+  display: grid; grid-template-columns: 70px 1fr; gap: 14px; align-items: center;
+  padding: 14px;
+  border-radius: var(--r-md);
+  background: var(--mist);
+  border: 1px solid var(--edge);
+}
+.codex-row__art { display: grid; place-items: center; height: 70px; }
+.codex-row__name { font-family: var(--font-display); font-size: 16px; font-weight: 500; }
+.codex-row__desc { font-size: 13px; color: var(--ink-soft); line-height: 1.45; margin: 4px 0 8px; }
+.codex-row__stats { display: flex; flex-wrap: wrap; gap: 6px; }
+.codex-row__stats .tag { font-size: 10.5px; }
+
+/* --------------------------------------------------------------------------
+   V6. Tutorial: cabeçalho, título e contador
+   -------------------------------------------------------------------------- */
+.tut__head { display: flex; justify-content: space-between; align-items: center; width: 100%; }
+.tut__counter { font-size: 11px; letter-spacing: .1em; color: var(--ink-mute); font-variant-numeric: tabular-nums; }
+.tut__title {
+  font-family: var(--font-display); font-weight: 700; font-size: 19px;
+  background: linear-gradient(90deg, var(--aura-a), #fff 60%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+  animation: tut-title-in 420ms ease both;
+}
+.tut__caption { font-family: var(--font-body); font-size: 14px; color: var(--ink-soft); line-height: 1.45; }
+@keyframes tut-title-in { from { opacity: 0; transform: translateY(6px); } }
+.tut__dots { flex-wrap: wrap; max-width: 70%; }
+
+/* --------------------------------------------------------------------------
+   V7. Resultado por desfecho (o overlay usa #overlay-result[data-outcome])
+   -------------------------------------------------------------------------- */
+#overlay-result[data-outcome="win"]  .result__halo { background: radial-gradient(circle, rgba(242,193,78,.45), transparent 65%); animation: halo-spin 6s linear infinite; }
+#overlay-result[data-outcome="loss"] .result__halo { background: radial-gradient(circle, rgba(255,107,129,.28), transparent 65%); }
+#overlay-result[data-outcome="draw"] .result__halo { background: radial-gradient(circle, rgba(200,210,230,.25), transparent 65%); }
+#overlay-result.overlay--open .result { animation: result-rise 520ms cubic-bezier(.3,1.4,.5,1) both; }
+@keyframes result-rise { from { opacity: 0; transform: translateY(30px) scale(.92); } }
+@keyframes halo-spin { to { transform: rotate(360deg) scale(1.05); } }
+.result__actions [hidden] { display: none !important; }
+
+/* --------------------------------------------------------------------------
+   V8. Ajustes finos para telas pequenas e movimento reduzido
+   -------------------------------------------------------------------------- */
+@media (max-width: 380px) {
+  .phase { grid-template-columns: 32px 1fr; }
+  .phase__stars { grid-column: 2; }
+  .codex-row { grid-template-columns: 56px 1fr; }
+  .arena-strip__name { font-size: 11px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .cell--portal::before, .piece--core .piece__crest, .piece--prism .piece__crest,
+  .audio-toggle__wave, .piece--showcase, .phase { animation: none !important; }
 }
