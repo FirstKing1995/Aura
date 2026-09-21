@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#05060d">
+  <meta name="description" content="Aura — jogo de tabuleiro 9x9 de território e cerco.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>Aura</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+
+<body data-screen="boot">
+
+<div class="aura-bg" aria-hidden="true">
+  <span class="aura-bg__orb aura-bg__orb--a"></span>
+  <span class="aura-bg__orb aura-bg__orb--b"></span>
+  <span class="aura-bg__grain"></span>
+</div>
+
+<main id="app" class="app">
+
+  <!-- ===================== chrome fixo ===================== -->
+  <header class="chrome">
+    <span class="chrome__mark">aura</span>
+    <span id="conn-badge" class="conn" role="status"></span>
+    <label class="lang">
+      <span class="sr-only" data-i18n="common.language">Idioma</span>
+      <select id="lang-select" class="lang__select" aria-label="Idioma"></select>
+    </label>
+  </header>
+
+  <!-- ===================== boot ===================== -->
+  <section id="screen-boot" class="screen screen--active" aria-hidden="false">
+    <div class="boot">
+      <div class="boot__sigil"><span></span><span></span><span></span></div>
+      <h1 class="boot__title">Aura</h1>
+      <p class="boot__tag" data-i18n="app.tagline"></p>
+    </div>
+  </section>
+
+  <!-- ===================== auth ===================== -->
+  <section id="screen-auth" class="screen" aria-hidden="true">
+    <div class="pane glass">
+      <h2 class="pane__title" data-i18n="auth.welcome"></h2>
+
+      <form id="auth-form" class="form" autocomplete="on" novalidate>
+        <label class="field">
+          <span class="field__label" data-i18n="auth.username"></span>
+          <input id="auth-username" class="field__input" type="text" name="username"
+                 autocomplete="username" maxlength="16" required
+                 data-i18n-attr="placeholder:auth.username">
+        </label>
+
+        <label class="field">
+          <span class="field__label" data-i18n="auth.password"></span>
+          <input id="auth-password" class="field__input" type="password" name="password"
+                 autocomplete="current-password" minlength="4" required
+                 data-i18n-attr="placeholder:auth.password">
+        </label>
+
+        <p id="auth-error" class="field-error" role="alert"></p>
+
+        <button id="auth-submit" class="btn btn--primary" type="submit"></button>
+      </form>
+
+      <button id="auth-switch" class="btn btn--ghost" type="button"
+              data-action="auth.switch" data-value="register"></button>
+
+      <div class="pane__divider"></div>
+
+      <button id="auth-offline" class="btn btn--quiet" type="button" data-action="auth.offline">
+        <span data-i18n="auth.offline"></span>
+      </button>
+      <p class="hint" data-i18n="auth.offlineHint"></p>
+    </div>
+  </section>
+
+  <!-- ===================== home ===================== -->
+  <section id="screen-home" class="screen" aria-hidden="true">
+
+    <div class="profile glass">
+      <div id="home-avatar" class="profile__avatar" data-division="iron"></div>
+      <div class="profile__info">
+        <p id="home-name" class="profile__name"></p>
+        <p class="profile__meta">
+          <span id="home-division" class="tag" data-division="iron"></span>
+          <span id="home-elo" class="profile__elo"></span>
+          <span id="home-record" class="profile__record"></span>
+        </p>
+      </div>
+    </div>
+
+    <div class="menu">
+      <button class="tile tile--primary" type="button" data-action="home.playOnline">
+        <span class="tile__title" data-i18n="home.playOnline"></span>
+        <span class="tile__glow"></span>
+      </button>
+
+      <button class="tile" type="button" data-action="home.playBot">
+        <span class="tile__title" data-i18n="home.playBot"></span>
+      </button>
+
+      <div class="menu__row">
+        <button class="tile tile--half" type="button" data-action="home.ranking">
+          <span class="tile__title" data-i18n="home.ranking"></span>
+        </button>
+        <button class="tile tile--half" type="button" data-action="home.tutorial">
+          <span class="tile__title" data-i18n="home.tutorial"></span>
+        </button>
+      </div>
+    </div>
+
+    <div class="levels glass">
+      <p class="levels__label" data-i18n="home.difficulty"></p>
+      <div id="level-group" class="chips" role="group">
+        <button class="chip" type="button" data-action="home.setLevel" data-value="novice"
+                data-i18n="level.novice"></button>
+        <button class="chip chip--on" type="button" data-action="home.setLevel" data-value="adept"
+                data-i18n="level.adept"></button>
+        <button class="chip" type="button" data-action="home.setLevel" data-value="master"
+                data-i18n="level.master"></button>
+      </div>
+    </div>
+
+    <button class="btn btn--quiet btn--small" type="button" data-action="home.logout"
+            data-i18n="home.logout"></button>
+  </section>
+
+  <!-- ===================== fila ===================== -->
+  <section id="screen-queue" class="screen" aria-hidden="true">
+    <div class="queue">
+      <div id="queue-ring" class="queue__ring" style="--progress:0">
+        <span class="queue__pulse"></span>
+        <span id="queue-timer" class="queue__timer">00:00</span>
+      </div>
+      <p class="queue__status" data-i18n="queue.searching"></p>
+      <p id="queue-count" class="queue__count"></p>
+      <p id="queue-hint" class="queue__hint"></p>
+      <button class="btn btn--ghost" type="button" data-action="queue.cancel"
+              data-i18n="queue.cancel"></button>
+    </div>
+  </section>
+
+  <!-- ===================== partida ===================== -->
+  <section id="screen-game" class="screen screen--game" aria-hidden="true">
+
+    <div id="player-top" class="player player--top glass" data-side="b">
+      <span class="player__dot"></span>
+      <span id="top-name" class="player__name"></span>
+      <span id="top-meta" class="player__meta"></span>
+    </div>
+
+    <div class="territory">
+      <span id="bar-label-a" class="territory__label territory__label--a">0%</span>
+      <div class="territory__track">
+        <span id="bar-a" class="territory__fill territory__fill--a"></span>
+        <span id="bar-b" class="territory__fill territory__fill--b"></span>
+        <span class="territory__goal" style="left:70%"></span>
+      </div>
+      <span id="bar-label-b" class="territory__label territory__label--b">0%</span>
+    </div>
+
+    <div id="board-host" class="board" role="application" aria-label="Aura"></div>
+
+    <div class="turn">
+      <span id="turn-dot" class="turn__dot" data-side="a"></span>
+      <span id="turn-label" class="turn__label"></span>
+    </div>
+
+    <div id="player-bottom" class="player player--bottom glass" data-side="a">
+      <span class="player__dot"></span>
+      <span id="bottom-name" class="player__name"></span>
+      <span id="bottom-meta" class="player__meta"></span>
+    </div>
+
+    <div class="game-actions">
+      <button class="btn btn--quiet btn--small" type="button" data-action="game.back"
+              data-i18n="common.back"></button>
+      <button class="btn btn--danger btn--small" type="button" data-action="game.resign"
+              data-i18n="game.resign"></button>
+    </div>
+  </section>
+
+  <!-- ===================== ranking ===================== -->
+  <section id="screen-rank" class="screen" aria-hidden="true">
+    <div class="pane glass">
+      <h2 class="pane__title" data-i18n="rank.title"></h2>
+      <ol id="rank-list" class="rank"></ol>
+      <button class="btn btn--ghost" type="button" data-action="nav.home"
+              data-i18n="common.back"></button>
+    </div>
+  </section>
+
+</main>
+
+<!-- ===================== overlays ===================== -->
+
+<div id="overlay-tutorial" class="overlay overlay--tutorial" aria-live="polite">
+  <div class="tut glass">
+    <div id="tut-dots" class="tut__dots"></div>
+    <p id="tut-caption" class="tut__caption"></p>
+    <button class="btn btn--quiet btn--small" type="button" data-action="tutorial.skip"
+            data-i18n="tutorial.skip"></button>
+  </div>
+</div>
+
+<div id="overlay-confirm" class="overlay overlay--center" role="dialog" aria-modal="true">
+  <div class="dialog glass">
+    <p id="confirm-text" class="dialog__text"></p>
+    <div class="dialog__actions">
+      <button id="confirm-no" class="btn btn--ghost" type="button"></button>
+      <button id="confirm-yes" class="btn btn--danger" type="button"></button>
+    </div>
+  </div>
+</div>
+
+<div id="overlay-result" class="overlay overlay--center" role="dialog" aria-modal="true" data-outcome="win">
+  <div class="result glass">
+    <div class="result__halo" aria-hidden="true"></div>
+    <h2 id="result-title" class="result__title"></h2>
+    <p id="result-reason" class="result__reason"></p>
+    <p class="result__elo-row">
+      <span id="result-elo" class="result__elo"></span>
+      <span id="result-delta" class="result__delta" data-sign="up"></span>
+    </p>
+    <div class="result__actions">
+      <button class="btn btn--primary" type="button" data-action="result.rematch"
+              data-i18n="result.rematch"></button>
+      <button class="btn btn--ghost" type="button" data-action="result.home"
+              data-i18n="result.home"></button>
+    </div>
+  </div>
+</div>
+
+<div id="toast-host" class="toast-host" aria-live="polite"></div>
+
+<!-- ===================== scripts ===================== -->
+<script src="js/config.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/rules.js"></script>
+<script src="js/ai.js"></script>
+<script src="js/bot.js"></script>
+<script src="js/i18n.js"></script>
+<script src="js/api.js"></script>
+<script src="js/net.js"></script>
+<script src="js/ui.js"></script>
+<script src="js/tutorial.js"></script>
+<script src="js/game.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
