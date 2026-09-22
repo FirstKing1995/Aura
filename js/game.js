@@ -528,8 +528,9 @@
     /* ----------------------------- fila ----------------------------- */
 
     async startQueue() {
+      // Online exige conta: convidado não tem identidade para a fila.
       if (this.guest || !API.isConfigured) {
-        this.ui.toast(I.t('auth.offlineHint'), 'warn');
+        this.ui.toast(I.t(API.isConfigured ? 'queue.needAccount' : 'auth.offlineHint'), 'warn');
         return this.startBotMatch();
       }
 
@@ -548,18 +549,31 @@
         if (elapsed >= CFG.NET.BOT_FALLBACK_MS) this.fallbackToBot();
       }, 250);
 
-      try {
-        const res = await API.queueJoin();
-        if (res.status === 'matched') return this.enterOnlineMatch(res.matchId, res.side);
-        this.queue.size = res.queueSize || 1;
-      } catch (err) {
-        this.handleNetworkError(err);
-        return this.fallbackToBot();
+      // Entrar na fila: um erro passageiro (servidor ocupado porque o outro
+      // jogador entrou no mesmo segundo, ou o Apps Script "acordando") NÃO
+      // manda mais para a IA. Tenta de novo até o relógio de 30s vencer.
+      let joined = false;
+      while (!joined && this.queue && !this.queue.closed) {
+        try {
+          const res = await API.queueJoin();
+          if (!this.queue || this.queue.closed) return;
+          if (res.status === 'matched') return this.enterOnlineMatch(res.matchId, res.side);
+          this.queue.size = res.queueSize || 1;
+          joined = true;
+        } catch (err) {
+          if (err && (err.code === 'EXPIRED_TOKEN' || err.code === 'BAD_TOKEN')) {
+            this._closeQueue();
+            return this.handleNetworkError(err);
+          }
+          await sleep(1200);
+        }
       }
+      if (!this.queue || this.queue.closed) return;
 
       this.queue.poller = new Poller(async () => {
         if (!this.queue || this.queue.closed) return;
         const res = await API.queuePoll();
+        if (!this.queue || this.queue.closed) return;
         if (res.status === 'matched') {
           this.ui.toast(I.t('queue.matched'), 'good');
           this.enterOnlineMatch(res.matchId, res.side);
@@ -569,7 +583,8 @@
       }, {
         interval: CFG.NET.QUEUE_POLL_MS,
         name: 'queue',
-        onError: err => this.handleNetworkError(err)
+        // erros de polling são silenciosos: o próximo tique tenta de novo
+        onError: err => { if (err && (err.code === 'EXPIRED_TOKEN' || err.code === 'BAD_TOKEN')) this.handleNetworkError(err); }
       }).start(false);
     }
 
