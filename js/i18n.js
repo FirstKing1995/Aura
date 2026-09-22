@@ -56,6 +56,7 @@
       'queue.startingBot': 'Ninguém por perto. Chamando a IA.',
       'queue.cancel': 'Cancelar busca',
       'queue.matched': 'Oponente encontrado',
+      'queue.needAccount': 'Online precisa de conta. Jogando contra a IA.',
 
       'game.yourTurn': 'Seu turno',
       'game.opponentTurn': 'Turno de {name}',
@@ -244,6 +245,7 @@
       'queue.startingBot': 'Nobody around. Calling the AI.',
       'queue.cancel': 'Cancel search',
       'queue.matched': 'Opponent found',
+      'queue.needAccount': 'Online needs an account. Playing the AI.',
 
       'game.yourTurn': 'Your turn',
       'game.opponentTurn': "{name}'s turn",
@@ -432,6 +434,7 @@
       'queue.startingBot': 'No hay nadie cerca. Llamando a la IA.',
       'queue.cancel': 'Cancelar búsqueda',
       'queue.matched': 'Oponente encontrado',
+      'queue.needAccount': 'El modo en línea necesita cuenta. Jugando contra la IA.',
 
       'game.yourTurn': 'Tu turno',
       'game.opponentTurn': 'Turno de {name}',
