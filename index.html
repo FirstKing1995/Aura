@@ -104,8 +104,8 @@
     </div>
 
     <div class="menu">
-      <button class="tile tile--primary" type="button" data-action="home.playOnline">
-        <span class="tile__title" data-i18n="home.playOnline"></span>
+      <button class="tile tile--primary" type="button" data-action="home.lobby">
+        <span class="tile__title" data-i18n="home.lobby"></span>
         <span class="tile__glow"></span>
       </button>
 
@@ -187,18 +187,25 @@
     </div>
   </section>
 
-  <!-- ===================== fila ===================== -->
-  <section id="screen-queue" class="screen" aria-hidden="true">
-    <div class="queue">
-      <div id="queue-ring" class="queue__ring" style="--progress:0">
-        <span class="queue__pulse"></span>
-        <span id="queue-timer" class="queue__timer">00:00</span>
+  <!-- ===================== lobby ===================== -->
+  <section id="screen-lobby" class="screen" aria-hidden="true">
+    <div class="pane glass pane--wide">
+      <h2 class="pane__title" data-i18n="lobby.title"></h2>
+      <p class="pane__sub" data-i18n="lobby.subtitle"></p>
+
+      <p id="lobby-status" class="lobby-status" role="status"></p>
+
+      <div id="lobby-outgoing" class="outgoing" hidden>
+        <span class="outgoing__pulse"></span>
+        <span id="outgoing-text" class="outgoing__text"></span>
+        <button class="btn btn--quiet btn--small" type="button" data-action="lobby.cancel"
+                data-i18n="lobby.cancelChallenge"></button>
       </div>
-      <p class="queue__status" data-i18n="queue.searching"></p>
-      <p id="queue-count" class="queue__count"></p>
-      <p id="queue-hint" class="queue__hint"></p>
-      <button class="btn btn--ghost" type="button" data-action="queue.cancel"
-              data-i18n="queue.cancel"></button>
+
+      <ul id="lobby-list" class="lobby"></ul>
+
+      <button class="btn btn--ghost" type="button" data-action="nav.home"
+              data-i18n="common.back"></button>
     </div>
   </section>
 
@@ -273,6 +280,18 @@
     <p id="tut-caption" class="tut__caption"></p>
     <button class="btn btn--quiet btn--small" type="button" data-action="tutorial.skip"
             data-i18n="tutorial.skip"></button>
+  </div>
+</div>
+
+<div id="overlay-challenge" class="overlay overlay--center" role="dialog" aria-modal="true">
+  <div class="dialog glass challenge">
+    <span class="challenge__spark" aria-hidden="true"></span>
+    <p id="challenge-text" class="dialog__text"></p>
+    <div id="challenge-timer" class="challenge__timer"><span></span></div>
+    <div class="dialog__actions">
+      <button id="challenge-no" class="btn btn--ghost" type="button" data-i18n="lobby.decline"></button>
+      <button id="challenge-yes" class="btn btn--primary" type="button" data-i18n="lobby.accept"></button>
+    </div>
   </div>
 </div>
 
