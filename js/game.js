@@ -367,6 +367,7 @@
     }
 
     goHome() {
+      this.closeLobby();
       this.ui.renderProfile(this.user || {
         username: I.t('common.you'), elo: '—', division: 'iron', wins: 0, losses: 0
       });
@@ -388,7 +389,7 @@
           this.ui.setAuthError(null);
         },
         'auth.offline':     () => this.playAsGuest(),
-        'home.playOnline':  () => this.startQueue(),
+        'home.lobby':       () => this.openLobby(),
         'home.playBot':     () => this.startBotMatch(),
         'home.campaign':    () => this.openCampaign(),
         'home.codex':       () => this.ui.showScreen('codex'),
@@ -398,7 +399,8 @@
         'home.setLevel':    ({ value }) => this.setLevel(value),
         'campaign.play':    ({ value }) => this.startPhase(Number(value)),
         'campaign.locked':  () => this.ui.toast(I.t('campaign.lockedHint'), 'warn'),
-        'queue.cancel':     () => this.cancelQueue(),
+        'lobby.challenge':  ({ value }) => this.sendChallenge(value),
+        'lobby.cancel':     () => this.cancelChallenge(),
         'game.resign':      () => this.confirmResign(),
         'game.back':        () => this.leaveMatch(),
         'result.rematch':   () => this.rematch(),
@@ -525,90 +527,110 @@
       this.startPhase(next.order);
     }
 
-    /* ----------------------------- fila ----------------------------- */
+    /* ----------------------------- lobby ----------------------------- */
 
-    async startQueue() {
-      // Online exige conta: convidado não tem identidade para a fila.
+    /**
+     * Lobby de presença. Um único heartbeat a cada 3s faz tudo: marca que
+     * estou online, traz quem mais está, os desafios recebidos e avisa
+     * quando alguém aceitou o meu — aí a partida abre sozinha nos dois lados.
+     */
+    openLobby() {
       if (this.guest || !API.isConfigured) {
-        this.ui.toast(I.t(API.isConfigured ? 'queue.needAccount' : 'auth.offlineHint'), 'warn');
+        this.ui.toast(I.t(API.isConfigured ? 'lobby.needAccount' : 'auth.offlineHint'), 'warn');
         return this.startBotMatch();
       }
 
-      this.queue = { startedAt: Date.now(), size: 1, poller: null, ticker: null, closed: false };
-      this.ui.showScreen('queue');
-      this.ui.renderQueue({ elapsedMs: 0, queueSize: 1, botInMs: CFG.NET.BOT_FALLBACK_MS });
+      this.closeLobby();
+      this.outgoing = null;
+      this.ui.showScreen('lobby');
+      this.ui.renderLobby({ players: [], outgoing: null, connecting: true });
 
-      this.queue.ticker = setInterval(() => {
-        if (!this.queue || this.queue.closed) return;
-        const elapsed = Date.now() - this.queue.startedAt;
-        this.ui.renderQueue({
-          elapsedMs: elapsed,
-          queueSize: this.queue.size,
-          botInMs: CFG.NET.BOT_FALLBACK_MS - elapsed
-        });
-        if (elapsed >= CFG.NET.BOT_FALLBACK_MS) this.fallbackToBot();
-      }, 250);
-
-      // Entrar na fila: um erro passageiro (servidor ocupado porque o outro
-      // jogador entrou no mesmo segundo, ou o Apps Script "acordando") NÃO
-      // manda mais para a IA. Tenta de novo até o relógio de 30s vencer.
-      let joined = false;
-      while (!joined && this.queue && !this.queue.closed) {
-        try {
-          const res = await API.queueJoin();
-          if (!this.queue || this.queue.closed) return;
-          if (res.status === 'matched') return this.enterOnlineMatch(res.matchId, res.side);
-          this.queue.size = res.queueSize || 1;
-          joined = true;
-        } catch (err) {
+      // Atribui ANTES de start(): o Poller dispara a primeira rodada de forma
+      // síncrona, e _lobbyTick precisa enxergar o poller já no lugar.
+      const poller = new Poller(() => this._lobbyTick(), {
+        interval: CFG.NET.LOBBY_POLL_MS,
+        name: 'lobby',
+        onError: err => {
           if (err && (err.code === 'EXPIRED_TOKEN' || err.code === 'BAD_TOKEN')) {
-            this._closeQueue();
-            return this.handleNetworkError(err);
+            this.closeLobby();
+            this.handleNetworkError(err);
           }
-          await sleep(1200);
         }
+      });
+      this.lobbyPoller = poller;
+      poller.start(true);
+    }
+
+    closeLobby() {
+      if (this.lobbyPoller) { this.lobbyPoller.stop(); this.lobbyPoller = null; }
+      this.ui.hideChallenge();
+      this._answering = false;
+    }
+
+    async _lobbyTick() {
+      if (!this.lobbyPoller) return;
+      const data = await API.lobbyHeartbeat();
+      if (!this.lobbyPoller) return;
+
+      // Desafio aceito (por mim ou por quem eu desafiei): entra na partida.
+      if (data.match && data.match.matchId) {
+        this.closeLobby();
+        this.ui.toast(I.t('queue.matched'), 'good');
+        return this.enterOnlineMatch(data.match.matchId, data.match.side);
       }
-      if (!this.queue || this.queue.closed) return;
 
-      this.queue.poller = new Poller(async () => {
-        if (!this.queue || this.queue.closed) return;
-        const res = await API.queuePoll();
-        if (!this.queue || this.queue.closed) return;
-        if (res.status === 'matched') {
-          this.ui.toast(I.t('queue.matched'), 'good');
-          this.enterOnlineMatch(res.matchId, res.side);
-        } else if (res.status === 'waiting') {
-          this.queue.size = res.queueSize || 1;
+      this.outgoing = data.outgoing || null;
+      this.ui.renderLobby({ players: data.players, outgoing: this.outgoing, connecting: false });
+
+      const incoming = (data.incoming || [])[0];
+      if (incoming && !this._answering) {
+        this.ui.showChallenge(incoming, accept => this.answerChallenge(incoming.id, accept));
+      } else if (!incoming) {
+        this.ui.hideChallenge();
+      }
+    }
+
+    async sendChallenge(targetId) {
+      if (!targetId) return;
+      try {
+        const res = await API.lobbyChallenge(targetId);
+        if (res.status === 'accepted' && res.matchId) {
+          // Desafio cruzado: os dois se desafiaram, então já começa.
+          this.closeLobby();
+          return this.enterOnlineMatch(res.matchId, res.side);
         }
-      }, {
-        interval: CFG.NET.QUEUE_POLL_MS,
-        name: 'queue',
-        // erros de polling são silenciosos: o próximo tique tenta de novo
-        onError: err => { if (err && (err.code === 'EXPIRED_TOKEN' || err.code === 'BAD_TOKEN')) this.handleNetworkError(err); }
-      }).start(false);
+        this.outgoing = res.challenge || null;
+        this.ui.renderLobby({ players: null, outgoing: this.outgoing, connecting: false });
+        this.ui.toast(I.t('lobby.sent'), 'good');
+        if (this.lobbyPoller) this.lobbyPoller.poke();
+      } catch (err) {
+        this.ui.toast(I.error(err && err.code), 'warn');
+        if (this.lobbyPoller) this.lobbyPoller.poke();
+      }
     }
 
-    _closeQueue() {
-      if (!this.queue) return;
-      this.queue.closed = true;
-      clearInterval(this.queue.ticker);
-      if (this.queue.poller) this.queue.poller.stop();
-      this.queue = null;
+    async cancelChallenge() {
+      const current = this.outgoing;
+      this.outgoing = null;
+      this.ui.renderLobby({ players: null, outgoing: null, connecting: false });
+      if (current) { try { await API.lobbyCancel(current.id); } catch (e) { /* silencioso */ } }
+      if (this.lobbyPoller) this.lobbyPoller.poke();
     }
 
-    async cancelQueue() {
-      this._closeQueue();
-      try { await API.queueLeave(); } catch (e) { /* silencioso */ }
-      this.goHome();
-    }
-
-    async fallbackToBot() {
-      if (!this.queue) return;
-      this.ui.renderQueue({ elapsedMs: CFG.NET.BOT_FALLBACK_MS, queueSize: this.queue.size, botInMs: 0 });
-      this._closeQueue();
-      try { await API.queueLeave(); } catch (e) {}
-      await sleep(600);
-      this.startBotMatch();
+    async answerChallenge(challengeId, accept) {
+      this._answering = true;
+      try {
+        const res = await API.lobbyRespond(challengeId, accept);
+        if (accept && res.matchId) {
+          this.closeLobby();
+          return this.enterOnlineMatch(res.matchId, res.side);
+        }
+      } catch (err) {
+        this.ui.toast(I.error(err && err.code), 'warn');
+      } finally {
+        this._answering = false;
+        if (this.lobbyPoller) this.lobbyPoller.poke();
+      }
     }
 
     /* --------------------------- partidas --------------------------- */
@@ -625,7 +647,7 @@
     }
 
     async enterOnlineMatch(matchId, side) {
-      this._closeQueue();
+      this.closeLobby();
       this.disposeSession();
       this.session = new OnlineMatchSession(this, { matchId, side });
       this.ui.showScreen('game');
@@ -634,7 +656,7 @@
         this.ui.board.intro();
       } catch (err) {
         this.handleNetworkError(err);
-        this.goHome();
+        this.openLobby();
       }
     }
 
@@ -846,14 +868,17 @@
       const phase = this.session && this.session.phase;
       this.disposeSession();
       if (phase) this.startPhase(phase.order);
-      else if (wasOnline) this.startQueue();
+      else if (wasOnline) this.openLobby();
       else this.startBotMatch();
     }
 
     leaveMatch() {
       const wasPhase = !!(this.session && this.session.phase);
+      const wasOnline = this.session instanceof OnlineMatchSession;
       this.disposeSession();
-      if (wasPhase) this.openCampaign(); else this.goHome();
+      if (wasPhase) this.openCampaign();
+      else if (wasOnline) this.openLobby();
+      else this.goHome();
     }
 
     disposeSession() {

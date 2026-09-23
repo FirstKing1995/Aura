@@ -173,6 +173,11 @@
     login(username, password)    { return this.call('auth.login', { username, password }, { auth: false, retries: 0 }); }
     me()                         { return this.call('auth.me'); }
 
+    lobbyHeartbeat()             { return this.call('lobby.heartbeat', {}, { retries: 0 }); }
+    lobbyChallenge(targetId)     { return this.call('lobby.challenge', { targetId }); }
+    lobbyRespond(challengeId, accept) { return this.call('lobby.respond', { challengeId, accept }); }
+    lobbyCancel(challengeId)     { return this.call('lobby.cancel', { challengeId }, { retries: 0 }); }
+
     queueJoin()                  { return this.call('queue.join'); }
     queuePoll()                  { return this.call('queue.poll', {}, { retries: 0 }); }
     queueLeave()                 { return this.call('queue.leave', {}, { retries: 0 }); }

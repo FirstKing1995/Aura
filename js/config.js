@@ -15,7 +15,7 @@
 
     API: Object.freeze({
       // Cole aqui a URL /exec da implantação do Apps Script.
-      BASE_URL: 'https://script.google.com/macros/s/AKfycbyWuksk8OCgkKdTBGGBlN6Qiy_tyD647Icl_8Ogc0fNQEUCRJiZsYltvHPLotHprwXHkQ/exec',
+      BASE_URL: 'https://script.google.com/macros/s/COLE_SEU_DEPLOYMENT_ID_AQUI/exec',
       TIMEOUT_MS: 15000,
       RETRIES: 2,
       RETRY_BACKOFF_MS: 700,
@@ -26,8 +26,9 @@
     NET: Object.freeze({
       QUEUE_POLL_MS: 2000,
       MATCH_POLL_MS: 2000,
+      LOBBY_POLL_MS: 3000,        // presença + desafios em uma chamada só
       POLL_BACKOFF_MAX_MS: 8000,
-      BOT_FALLBACK_MS: 30000      // 30s na fila -> partida contra a IA
+      BOT_FALLBACK_MS: 30000      // (legado da fila; o lobby não cai para a IA)
     }),
 
     BOARD: Object.freeze({

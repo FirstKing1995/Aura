@@ -455,7 +455,7 @@
           home: q('screen-home'),
           campaign: q('screen-campaign'),
           codex: q('screen-codex'),
-          queue: q('screen-queue'),
+          lobby: q('screen-lobby'),
           game: q('screen-game'),
           rank: q('screen-rank')
         },
@@ -482,11 +482,16 @@
         audioToggle: q('audio-toggle'),
         musicRange: q('music-range'),
         sfxRange: q('sfx-range'),
-        // queue
-        queueTimer: q('queue-timer'),
-        queueCount: q('queue-count'),
-        queueHint: q('queue-hint'),
-        queueRing: q('queue-ring'),
+        // lobby
+        lobbyList: q('lobby-list'),
+        lobbyStatus: q('lobby-status'),
+        lobbyOutgoing: q('lobby-outgoing'),
+        outgoingText: q('outgoing-text'),
+        challenge: q('overlay-challenge'),
+        challengeText: q('challenge-text'),
+        challengeTimer: q('challenge-timer'),
+        challengeYes: q('challenge-yes'),
+        challengeNo: q('challenge-no'),
         // game
         boardHost: q('board-host'),
         arenaName: q('arena-name'),
@@ -785,17 +790,87 @@
       });
     }
 
-    /* ----------------------- fila ----------------------- */
+    /* ----------------------- lobby ----------------------- */
 
-    renderQueue({ elapsedMs, queueSize, botInMs }) {
-      this.els.queueTimer.textContent = formatDuration(elapsedMs);
-      this.els.queueCount.textContent = I.t('queue.inQueue', { count: queueSize });
-      const seconds = Math.max(0, Math.ceil(botInMs / 1000));
-      this.els.queueHint.textContent = seconds > 0
-        ? I.t('queue.botIn', { seconds })
-        : I.t('queue.startingBot');
-      const progress = clamp(elapsedMs / CFG.NET.BOT_FALLBACK_MS, 0, 1);
-      this.els.queueRing.style.setProperty('--progress', progress.toFixed(3));
+    /**
+     * Lista de presença. Só redesenha as linhas que mudaram de conteúdo:
+     * o heartbeat roda a cada 3s e recriar a lista inteira faria o dedo do
+     * jogador perder o botão no meio do toque.
+     */
+    renderLobby({ players, outgoing, connecting }) {
+      const host = this.els.lobbyList;
+      const list = players || [];
+
+      this.els.lobbyStatus.textContent = connecting
+        ? I.t('lobby.connecting')
+        : (list.length ? I.t('lobby.online', { count: list.length }) : I.t('lobby.empty'));
+      this.els.lobbyStatus.dataset.empty = list.length ? 'false' : 'true';
+
+      const signature = list.map(p => p.id + ':' + p.busy + ':' + p.elo).join('|') +
+        '#' + (outgoing ? outgoing.toId : '');
+      if (signature !== this._lobbySignature) {
+        this._lobbySignature = signature;
+        host.innerHTML = '';
+        list.forEach(p => {
+          const waiting = outgoing && outgoing.toId === p.id;
+          host.appendChild(el('li', { class: 'lobby-row' + (p.busy ? ' lobby-row--busy' : '') }, [
+            el('span', { class: 'lobby-row__dot', 'data-busy': String(p.busy) }),
+            el('span', { class: 'lobby-row__body' }, [
+              el('span', { class: 'lobby-row__name', text: p.name }),
+              el('span', { class: 'lobby-row__meta' }, [
+                el('span', { class: 'tag tag--quiet', 'data-division': p.division,
+                             text: I.t('division.' + p.division) }),
+                el('span', { class: 'lobby-row__elo', text: String(p.elo) })
+              ])
+            ]),
+            p.busy
+              ? el('span', { class: 'lobby-row__state', text: I.t('lobby.inMatch') })
+              : el('button', {
+                  class: 'btn btn--small' + (waiting ? ' btn--quiet' : ' btn--primary'),
+                  type: 'button',
+                  'data-action': 'lobby.challenge',
+                  'data-value': p.id,
+                  text: I.t(waiting ? 'lobby.waiting' : 'lobby.challenge')
+                })
+          ]));
+        });
+      }
+
+      this.els.lobbyOutgoing.hidden = !outgoing;
+      if (outgoing) {
+        this.els.outgoingText.textContent = I.t('lobby.sentTo', { name: outgoing.toName });
+        this.els.lobbyOutgoing.dataset.id = outgoing.id;
+      }
+    }
+
+    /** Desafio recebido: modal com contagem regressiva visível. */
+    showChallenge(challenge, onAnswer) {
+      if (this._challengeId === challenge.id) return;
+      this._challengeId = challenge.id;
+      this.els.challengeText.textContent =
+        I.t('lobby.challengedYou', { name: challenge.fromName, elo: challenge.fromElo });
+
+      const bar = this.els.challengeTimer.firstElementChild;
+      const total = Math.max(1, challenge.expiresInMs);
+      bar.style.transition = 'none';
+      bar.style.width = '100%';
+      requestAnimationFrame(() => {
+        bar.style.transition = 'width ' + total + 'ms linear';
+        bar.style.width = '0%';
+      });
+
+      const answer = accept => { this.hideChallenge(); onAnswer(accept); };
+      this.els.challengeYes.onclick = () => answer(true);
+      this.els.challengeNo.onclick = () => answer(false);
+
+      this.els.challenge.classList.add('overlay--open');
+      AUDIO.play('phase');
+      haptic([18, 60, 18]);
+    }
+
+    hideChallenge() {
+      this._challengeId = null;
+      this.els.challenge.classList.remove('overlay--open');
     }
 
     /* ----------------------- partida ----------------------- */
